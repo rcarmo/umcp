@@ -121,7 +121,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         # Run as MCP server
         server = SimpleAsyncTestServer()
-        server.run_mcp_server()
+        server.run()
     else:
         # Run tests
         asyncio.run(main())

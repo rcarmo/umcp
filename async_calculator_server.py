@@ -145,4 +145,4 @@ class AsyncCalculatorMCPServer(AsyncMCPServer):
 if __name__ == "__main__":
     # Start the Async Calculator MCP server
     server = AsyncCalculatorMCPServer()
-    server.run_mcp_server()
+    server.run()

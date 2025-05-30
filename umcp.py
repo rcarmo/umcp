@@ -321,7 +321,7 @@ class MCPServer:
     
     # ==== Main execution ====
     
-    def run_mcp_server(self, args: list = None):
+    def run(self, args: list = None):
         """Run the MCP server."""
         if args is None:
             args = argv[1:]
@@ -379,4 +379,4 @@ class MCPServer:
 if __name__ == "__main__":
     # This will be overridden by subclasses
     server = MCPServer()
-    server.run_mcp_server()
+    server.run()

@@ -91,4 +91,4 @@ class CalculatorMCPServer(MCPServer):
 if __name__ == "__main__":
     # Start the Calculator MCP server
     server = CalculatorMCPServer()
-    server.run_mcp_server()
+    server.run()

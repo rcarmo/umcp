@@ -67,4 +67,4 @@ class MovieMCPServer(MCPServer):
 if __name__ == "__main__":
     # Start the MCP server
     server = MovieMCPServer()
-    server.run_mcp_server()
+    server.run()

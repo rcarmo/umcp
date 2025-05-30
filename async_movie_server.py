@@ -238,4 +238,4 @@ class AsyncMovieMCPServer(AsyncMCPServer):
 if __name__ == "__main__":
     # Start the Async Movie MCP server
     server = AsyncMovieMCPServer()
-    server.run_mcp_server()
+    server.run()

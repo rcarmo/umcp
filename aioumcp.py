@@ -320,7 +320,7 @@ class AsyncMCPServer:
     
     # ==== Main execution ====
     
-    async def run_mcp_server_async(self, args: list = None):
+    async def run_async(self, args: list = None):
         """Run the MCP server asynchronously."""
         if args is None:
             args = argv[1:]
@@ -388,10 +388,10 @@ class AsyncMCPServer:
                 self.logger.error("Async MCP Server error: %s", e)
                 exit(1)
     
-    def run_mcp_server(self, args: list = None):
+    def run(self, args: list = None):
         """Synchronous wrapper to run the async MCP server."""
         try:
-            run(self.run_mcp_server_async(args))
+            run(self.run_async(args))
         except KeyboardInterrupt:
             self.logger.info("Async MCP Server stopped by user.")
             sys.exit(0)
@@ -400,4 +400,4 @@ class AsyncMCPServer:
 if __name__ == "__main__":
     # This will be overridden by subclasses
     server = AsyncMCPServer()
-    server.run_mcp_server()
+    server.run()
