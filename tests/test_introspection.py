@@ -57,7 +57,7 @@ def test_introspected_movie_server():
         }
     })
     
-    assert response.get("result", {}).get("serverInfo", {}).get("name") == "IntrospectedMovieMCPServer"
+    assert response.get("result", {}).get("serverInfo", {}).get("name") == "MovieMCPServer"
     print("  ✅ Initialize works")
     
     # Test 2: Tools list with introspection

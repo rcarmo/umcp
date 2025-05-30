@@ -62,6 +62,53 @@ class MovieMCPServer(MCPServer):
         except (ValueError, TypeError, KeyError) as e:
             self.logger.error("Error booking ticket: %s", e)
             return None
+    
+    def tool_get_showtimes(self, movie_id: int) -> List[str]:
+        """Get showtimes for a specific movie.
+        
+        Args:
+            movie_id: ID of the movie to get showtimes for
+            
+        Returns:
+            List of showtimes for the specified movie
+        """
+        for movie in self.movies_data:
+            if movie["id"] == movie_id:
+                return movie["showTimes"]
+        return []
+    
+    def tool_search_movies(self, title: Optional[str] = None, min_price: Optional[float] = None, max_price: Optional[float] = None) -> List[Dict[str, Any]]:
+        """Search for movies by title and/or price range.
+        
+        Args:
+            title: Optional title to search for (case-insensitive partial match)
+            min_price: Optional minimum price
+            max_price: Optional maximum price
+            
+        Returns:
+            List of matching movies
+        """
+        results = []
+        
+        for movie in self.movies_data:
+            match = True
+            
+            # Check title if provided
+            if title and title.lower() not in movie["title"].lower():
+                match = False
+                
+            # Check min price if provided
+            if min_price is not None and movie["price"] < min_price:
+                match = False
+                
+            # Check max price if provided
+            if max_price is not None and movie["price"] > max_price:
+                match = False
+                
+            if match:
+                results.append(movie)
+                
+        return results
 
 
 if __name__ == "__main__":
