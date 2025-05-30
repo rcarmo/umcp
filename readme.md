@@ -1,8 +1,8 @@
-# 🐚 MCP Server in Bash
+# 🐚 MicroMCP
 
-A lightweight, zero-overhead implementation of the [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server in pure Bash. 
+This is a lightweight, zero-overhead implementation of [Model Context Protocol (MCP)](https://modelcontextprotocol.io) in pure Python inspired by the original `bash`` implementation by Muthukumaran Navaneethakrishnan.
 
-**Why?** Most MCP servers are just API wrappers with schema conversion. This implementation provides a zero-overhead alternative to Node.js, Python, or other heavy runtimes.
+**Why?** I found the idea of using the simplest possible implementation of MCP in a shell script fascinating, but I wanted to see how it would look in Python with true introspection capabilities.
 
 ---
 
@@ -11,15 +11,14 @@ A lightweight, zero-overhead implementation of the [Model Context Protocol (MCP)
 * ✅ Full JSON-RPC 2.0 protocol over stdio
 * ✅ Complete MCP protocol implementation
 * ✅ Dynamic tool discovery via function naming convention
-* ✅ External configuration via JSON files
+* ✅ Complete introspection of function signatures
 * ✅ Easy to extend with custom tools
 
 ---
 
 ## 🔧 Requirements
 
-- Bash shell
-- `jq` for JSON processing (`brew install jq` on macOS)
+- Python 3
 
 ---
 
@@ -28,20 +27,13 @@ A lightweight, zero-overhead implementation of the [Model Context Protocol (MCP)
 1. **Clone the repo**
 
 ```bash
-git clone https://github.com/muthuishere/mcp-server-bash-sdk
-cd mcp-server-bash-sdk
+git clone https://github.com/rcarmo/micro-mcp
 ```
 
-2. **Make scripts executable**
+2. **Try it out**
 
 ```bash
-chmod +x mcpserver_core.sh moviemcpserver.sh
-```
-
-3. **Try it out**
-
-```bash
-echo '{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "get_movies"}, "id": 1}' | ./moviemcpserver.sh
+echo '{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "get_movies"}, "id": 1}' | python ./introspected_movie_server.py
 ```
 
 ---
@@ -49,23 +41,23 @@ echo '{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "get_movies"
 ## 🏗️ Architecture
 
 ```
-┌─────────────┐         ┌────────────────────────┐
-│ MCP Host    │         │ MCP Server             │
-│ (AI System) │◄──────► │ (moviemcpserver.sh)    │
-└─────────────┘ stdio   └────────────────────────┘
-                             │
-                     ┌───────┴──────────┐
-                     ▼                  ▼
-              ┌─────────────────┐  ┌───────────────┐
-              │ Protocol Layer  │  │ Business Logic│
-              │(mcpserver_core.sh)│  │(tool_* funcs)│
-              └─────────────────┘  └───────────────┘
-                     │                  │
-                     ▼                  ▼
-              ┌─────────────────┐  ┌───────────────┐
-              │ Configuration   │  │ External      │
-              │ (JSON Files)    │  │ Services/APIs │
-              └─────────────────┘  └───────────────┘
+┌─────────────┐         ┌───────────────┐
+│ MCP Host    │         │ MCP Server    │
+│ (AI System) │◄──────► │ (myserver.py) │
+└─────────────┘ stdio   └───────────────┘
+                                │
+                      ┌─────────┴──────────┐
+                      ▼                    ▼
+              ┌────────────────┐  ┌────────────────┐
+              │ Protocol Layer │  │ Business Logic │
+              │ (umcp.py)      │  │(tool_* methods)│
+              └────────────────┘  └────────────────┘
+                      │                    │
+                      ▼                    ▼
+              ┌───────────────┐    ┌───────────────┐
+              │ Introspection │    │ External      │
+              └───────────────┘    │ Services/APIs │
+                                   └───────────────┘
 ```
 
 - **mcpserver_core.sh**: Handles JSON-RPC and MCP protocol
