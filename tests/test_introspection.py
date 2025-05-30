@@ -1,22 +1,6 @@
-#!/usr/bin/env p    try:
-        # Use a relative path that works when run from the tests directory
-        script_path = "../" + server_script
-        print(f"DEBUG: Executing {sys.executable} {script_path}")
-        print(f"DEBUG: Request: {request_json}")
-        
-        result = subprocess.run(
-            [sys.executable, script_path],
-            input=request_json,
-            text=True,
-            capture_output=True,
-            check=False,
-            cwd=os.path.dirname(os.path.abspath(__file__))
-        )
-        
-        if result.returncode != 0:
-            print(f"Error running {server_script}: {result.stderr}")
-            print(f"DEBUG: Stdout: {result.stdout}")
-            return {}introspection.py - Comprehensive test of the introspection-based MCP servers
+#!/usr/bin/env python3
+"""
+test_introspection.py - Comprehensive test of the introspection-based MCP servers
 Tests true introspection functionality that generates tool definitions from class members and type annotations
 """
 
@@ -34,17 +18,20 @@ def send_request(server_script: str, request: Dict[str, Any]) -> Dict[str, Any]:
         # Use a relative path that works when run from the tests directory
         script_path = "../" + server_script
         print(f"DEBUG: Executing {sys.executable} {script_path}")
+        print(f"DEBUG: Request: {request_json}")
         
         result = subprocess.run(
             [sys.executable, script_path],
             input=request_json,
             text=True,
             capture_output=True,
+            check=False,
             cwd=os.path.dirname(os.path.abspath(__file__))
         )
         
         if result.returncode != 0:
             print(f"Error running {server_script}: {result.stderr}")
+            print(f"DEBUG: Stdout: {result.stdout}")
             return {}
         
         return json.loads(result.stdout.strip())
