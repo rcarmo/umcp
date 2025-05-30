@@ -18,7 +18,7 @@ This is a lightweight, zero-overhead implementation of [Model Context Protocol (
 
 ## 🔧 Requirements
 
-- Python 3
+* Python 3
 
 ---
 
@@ -27,20 +27,20 @@ This is a lightweight, zero-overhead implementation of [Model Context Protocol (
 1. **Clone the repo**
 
 ```bash
-git clone https://github.com/rcarmo/micro-mcp
+git clone https://github.com/rcarmo/umcp
 ```
 
 2. **Try it out**
 
 ```bash
-echo '{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "get_movies"}, "id": 1}' | python ./introspected_movie_server.py
+echo '{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "get_movies"}, "id": 1}' | python ./movie_server.py
 ```
 
 ---
 
 ## 🏗️ Architecture
 
-```
+```diagram
 ┌─────────────┐         ┌───────────────┐
 │ MCP Host    │         │ MCP Server    │
 │ (AI System) │◄──────► │ (myserver.py) │
@@ -64,7 +64,7 @@ echo '{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "get_movies"
 
 ## 🔌 Examples
 
-This implementation includes two simple example servers that demonstrate how to use the MCP protocol, one for a movie booking system and another for a calculator. 
+This implementation includes two simple example servers that demonstrate how to use the MCP protocol, one for a movie booking system and another for a calculator.
 
 Both are supplied in synchronous and asynchronous versions, showcasing how to implement tools and introspection.
 
