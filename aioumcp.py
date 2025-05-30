@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-async_micromcp.py - Async MCP (Model Context Protocol) server implementation
+aioumcp.py - Async MCP (Model Context Protocol) server implementation
 Handles JSON-RPC 2.0 messaging and MCP protocol infrastructure with asyncio support
 """
 

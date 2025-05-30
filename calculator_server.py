@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-calculatormcpserver.py - Calculator MCP server example
+caulculator_server.py - Calculator MCP server example
 Demonstrates pure Python MCP server without JSON configuration files
 """
 

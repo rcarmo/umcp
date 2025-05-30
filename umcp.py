@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-micromcp.py - Core MCP (Model Context Protocol) server implementation
+umcp.py - Core MCP (Model Context Protocol) server implementation
 Handles JSON-RPC 2.0 messaging and MCP protocol infrastructure
 """
 

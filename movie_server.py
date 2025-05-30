@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-moviemcpserver.py - Movie business logic implementation
+movie_server.py - Movie business logic implementation
 """
 
 from time import time
