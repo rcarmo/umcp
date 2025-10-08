@@ -43,7 +43,7 @@ class AsyncMCPServer:
     def get_config(self) -> Dict[str, Any]:
         """Generate server configuration dynamically."""
         return {
-            "protocolVersion": "0.1.0",
+            "protocolVersion": "2025-06-18",
             "serverInfo": {
                 "name": self.__class__.__name__,
                 "version": "0.1.0"
@@ -74,8 +74,8 @@ class AsyncMCPServer:
                 # Extract description from docstring (first line)
                 description = doc.split('\n')[0].strip()
                 
-                # Generate schema from method signature
-                schema = self._generate_schema_from_signature(sig)
+                # Generate schema from method signature and the method object
+                schema = self._generate_schema_from_signature(sig, method)
                 
                 # Check if method is async
                 is_async = iscoroutinefunction(method)
@@ -93,33 +93,46 @@ class AsyncMCPServer:
         
         return {"tools": tools}
     
-    def _generate_schema_from_signature(self, sig: Signature) -> Dict[str, Any]:
-        """Generate JSON schema from method signature."""
-        # Get type hints
-        try:
-            type_hints = get_type_hints(sig.return_annotation.__func__ if hasattr(sig.return_annotation, '__func__') else lambda: None)
-        except (TypeError, AttributeError, NameError):
-            type_hints = {}
-        
+    def _generate_schema_from_signature(self, sig: Signature, method=None) -> Dict[str, Any]:
+        """Generate JSON schema from method signature.
+
+        Args:
+            sig: The inspect.Signature for the method.
+            method: Optional callable object to resolve forward-referenced type hints.
+        """
+        # Resolve type hints from the method if possible (handles forward refs)
+        type_hints = {}
+        if method is not None:
+            try:
+                type_hints = get_type_hints(method)
+            except (TypeError, AttributeError, NameError):
+                type_hints = {}
+
         # Get parameters (excluding 'self')
         params = [p for name, p in sig.parameters.items() if name != 'self']
-        
+
         if not params:
             return {}
-        
+
         # Create schema from individual parameters
         properties = {}
         required = []
-        
+
         for param in params:
-            param_type = type_hints.get(param.name)
-            
+            # Prefer resolved type hints when available
+            param_type = Parameter.empty
+            if type_hints and param.name in type_hints:
+                param_type = type_hints.get(param.name)
+            elif param.annotation != Parameter.empty:
+                # Fall back to the raw annotation from the signature
+                param_type = param.annotation
+
             prop_def = self._type_to_json_schema(param_type)
             properties[param.name] = prop_def
-            
+
             if param.default == Parameter.empty:
                 required.append(param.name)
-        
+
         if properties:
             schema = {
                 "type": "object",
@@ -128,24 +141,31 @@ class AsyncMCPServer:
             if required:
                 schema["required"] = required
             return schema
-        
+
         return {}
     
     def _type_to_json_schema(self, param_type) -> Dict[str, Any]:
         """Convert Python type annotation to JSON schema property."""
+        # Check for None or missing annotation
         if param_type is None or param_type == type(None):
             return {"type": "null"}
-        elif param_type is str:
+        
+        # Check if param_type is Parameter.empty (no annotation)
+        if param_type == Parameter.empty:
+            return {"type": "string"}  # Default for unannotated params
+        
+        # Handle basic types
+        if param_type is str or param_type == str:
             return {"type": "string"}
-        elif param_type is int:
+        elif param_type is int or param_type == int:
             return {"type": "integer"}
-        elif param_type is float:
+        elif param_type is float or param_type == float:
             return {"type": "number"}
-        elif param_type is bool:
+        elif param_type is bool or param_type == bool:
             return {"type": "boolean"}
-        elif param_type is list:
+        elif param_type is list or param_type == list:
             return {"type": "array"}
-        elif param_type is dict:
+        elif param_type is dict or param_type == dict:
             return {"type": "object"}
         
         # Handle Union types (e.g., Optional[str])
@@ -344,7 +364,7 @@ class AsyncMCPServer:
                     
             except (OSError, IOError) as e:
                 self.logger.error("Error reading file %s: %s", args[0], e)
-                sys.exit(1)
+                exit(1)
         else:
             # Continuously read from stdin line by line using asyncio
             self.logger.info("Async MCP Server started. Waiting for JSON-RPC 2.0 messages...")
@@ -394,7 +414,7 @@ class AsyncMCPServer:
             run(self.run_async(args))
         except KeyboardInterrupt:
             self.logger.info("Async MCP Server stopped by user.")
-            sys.exit(0)
+            exit(0)
 
 
 if __name__ == "__main__":
