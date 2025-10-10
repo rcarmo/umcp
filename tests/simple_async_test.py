@@ -35,41 +35,31 @@ def test_introspection():
     print("🔍 Testing tool introspection...")
     server = SimpleAsyncTestServer()
     tools = server.discover_tools()
-    
-    print(f"Discovered {len(tools['tools'])} tools:")
-    for tool in tools['tools']:
+    tool_list = tools['tools']
+    assert len(tool_list) >= 2, "Expected at least 2 tools"
+    names = {t['name'] for t in tool_list}
+    assert 'hello' in names and 'hello_async' in names
+    print(f"Discovered {len(tool_list)} tools:")
+    for tool in tool_list:
         async_flag = " (ASYNC)" if tool.get('async', False) else " (SYNC)"
         print(f"  - {tool['name']}{async_flag}: {tool['description']}")
-    
-    return tools
+    # No return (pytest warning avoidance)
 
 
-async def test_tool_execution():
-    """Test actual tool execution."""
+async def _test_tool_execution_async():
+    """Async body for tool execution test (invoked via sync wrapper for pytest)."""
     print("\n🛠️  Testing tool execution...")
     server = SimpleAsyncTestServer()
-    
-    # Test sync tool
-    print("Testing sync tool...")
-    try:
-        response = await server.handle_tools_call_async(1, {
-            "name": "hello", 
-            "arguments": {"name": "Sync"}
-        })
-        print(f"Sync response: {response}")
-    except Exception as e:
-        print(f"Sync tool error: {e}")
-    
-    # Test async tool
-    print("Testing async tool...")
-    try:
-        response = await server.handle_tools_call_async(2, {
-            "name": "hello_async", 
-            "arguments": {"name": "Async"}
-        })
-        print(f"Async response: {response}")
-    except Exception as e:
-        print(f"Async tool error: {e}")
+    # Sync tool
+    response = await server.handle_tools_call_async(1, {"name": "hello", "arguments": {"name": "Sync"}})
+    assert response["result"]["content"][0]["type"] == "text"
+    # Async tool
+    response2 = await server.handle_tools_call_async(2, {"name": "hello_async", "arguments": {"name": "Async"}})
+    assert response2["result"]["content"][0]["type"] == "text"
+
+def test_tool_execution():
+    """Pytest-compatible wrapper that runs the async test."""
+    asyncio.run(_test_tool_execution_async())
 
 
 def test_json_rpc():
@@ -84,11 +74,12 @@ def test_json_rpc():
     }
     
     # Write to temp file
-    with open("test_request.json", "w") as f:
+    with open("test_request.json", "w", encoding="utf-8") as f:
         json.dump(test_request, f)
-    
     print("Test request created: test_request.json")
-    return "test_request.json"
+    # Assert file exists instead of returning value
+    from pathlib import Path as _P
+    assert _P("test_request.json").exists()
 
 
 async def main():
@@ -98,19 +89,19 @@ async def main():
     
     try:
         # Test introspection
-        tools = test_introspection()
+        test_introspection()
         
         # Test tool execution
         await test_tool_execution()
         
         # Test JSON-RPC
-        test_file = test_json_rpc()
+        test_json_rpc()
         
-        print(f"\n✅ All tests completed successfully!")
-        print(f"🎯 You can test the server with:")
-        print(f"   python3 simple_async_test.py {test_file}")
+        print("\n✅ All tests completed successfully!")
+        print("🎯 You can test the server with:")
+        print("   python3 simple_async_test.py test_request.json")
         
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 broad for test harness simplicity
         print(f"\n❌ Test failed: {e}")
         import traceback
         traceback.print_exc()

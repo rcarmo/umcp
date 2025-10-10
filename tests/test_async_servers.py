@@ -36,8 +36,8 @@ def send_request(server_script: str, request: dict) -> dict:
         return {"error": f"Request failed: {e}"}
 
 
-async def test_async_performance():
-    """Test async server performance with concurrent operations."""
+async def _test_async_performance_async():
+    """Async body for performance test (wrapped for pytest)."""
     print("🚀 Testing Async MCP Server Performance\n")
     
     # Test 1: Tools discovery
@@ -240,6 +240,10 @@ def test_introspection():
         
         print()
 
+
+def test_async_performance():
+    """Pytest wrapper to run async performance test without pytest-asyncio plugin."""
+    asyncio.run(_test_async_performance_async())
 
 if __name__ == "__main__":
     print("🧪 Async MCP Server Test Suite")

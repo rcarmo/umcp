@@ -109,6 +109,18 @@ class MovieMCPServer(MCPServer):
                 results.append(movie)
                 
         return results
+    
+    def prompt_movie_recommendation(self, genre: str) -> str:
+        """Generate a prompt for recommending movies based on genre.
+        Categories: movies, recommendation
+        """
+        return f"Can you recommend some good {genre} movies?"
+
+    def prompt_ticket_booking(self, movie_title: str, show_time: str) -> str:
+        """Generate a prompt for booking tickets for a specific movie and showtime.
+        Categories: movies, booking
+        """
+        return f"How can I book tickets for '{movie_title}' at {show_time}?"
 
 
 if __name__ == "__main__":

@@ -233,6 +233,18 @@ class AsyncMovieMCPServer(AsyncMCPServer):
             {"id": "rec_1", "title": f"Recommended: {query.title()} 2", "source": "recommendations"},
             {"id": "rec_2", "title": f"You might like: {query.title()} Redux", "source": "recommendations"}
         ]
+    
+    def prompt_movie_search(self, title: str) -> str:
+        """Generate a prompt for searching movies by title.
+        Categories: movies, search
+        """
+        return f"Can you find movies with the title '{title}'?"
+
+    async def prompt_booking_confirmation(self, movie_title: str, customer_email: str) -> str:
+        """Generate a prompt for confirming a movie ticket booking.
+        Categories: movies, booking
+        """
+        return f"Please confirm the booking for '{movie_title}' sent to {customer_email}."
 
 
 if __name__ == "__main__":

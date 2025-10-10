@@ -86,6 +86,18 @@ class CalculatorMCPServer(MCPServer):
         except (ValueError, TypeError) as e:
             self.logger.error("Error in divide operation: %s", e)
             return {"error": "Invalid input for division"}
+    
+    def prompt_calculate_sum(self, a: float, b: float) -> str:
+        """Generate a prompt for calculating the sum of two numbers.
+        Categories: math, calculation
+        """
+        return f"What is the sum of {a} and {b}?"
+
+    def prompt_calculate_difference(self, a: float, b: float) -> str:
+        """Generate a prompt for calculating the difference between two numbers.
+        Categories: math, calculation
+        """
+        return f"What is the difference when {b} is subtracted from {a}?"
 
 
 if __name__ == "__main__":

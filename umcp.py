@@ -6,10 +6,10 @@ Handles JSON-RPC 2.0 messaging and MCP protocol infrastructure
 
 from inspect import getdoc, getmembers, ismethod, signature, Parameter
 from logging import FileHandler, basicConfig, getLogger, INFO
-from sys import argv, exit, stdin
+from sys import argv, stdin
 from json import JSONDecodeError, dumps, loads
 from pathlib import Path
-from typing import Any, Dict, Optional, Union, get_args, get_origin, get_type_hints
+from typing import Any, Dict, Optional, Union, List, get_args, get_origin, get_type_hints
 
 
 class MCPServer:
@@ -23,7 +23,7 @@ class MCPServer:
         # Set up logging
         self._setup_logging()
         
-    def _setup_logging(self):
+    def _setup_logging(self) -> None:
         """Set up logging configuration."""
         # Create logs directory if it doesn't exist
         self.log_file.parent.mkdir(exist_ok=True)
@@ -42,7 +42,7 @@ class MCPServer:
     def get_config(self) -> Dict[str, Any]:
         """Generate server configuration dynamically."""
         return {
-            "protocolVersion": "0.1.0",
+            "protocolVersion": "2025-03-26",
             "serverInfo": {
                 "name": self.__class__.__name__,
                 "version": "0.1.0"
@@ -50,6 +50,10 @@ class MCPServer:
             "capabilities": {
                 "tools": {
                     "listChanged": True
+                },
+                "prompts": {
+                    "listChanged": True,
+                    "get": True,
                 }
             },
             "instructions": self.get_instructions()
@@ -84,7 +88,148 @@ class MCPServer:
                 tools.append(tool_def)
         
         return {"tools": tools}
-    
+
+    def discover_prompts(self) -> Dict[str, Any]:
+        """Discover available prompts through introspection.
+
+        A prompt is any method whose name starts with 'prompt_'. Its docstring
+        becomes the description and its signature is converted to a JSON schema
+        (similar to tool parameter extraction). This allows clients to list
+        reusable, parameterizable prompt templates via the `prompts/list` RPC.
+        """
+        prompts = []
+        for name, method in getmembers(self, predicate=ismethod):
+            if not name.startswith('prompt_'):
+                continue
+            prompt_name = name[7:]
+            sig = signature(method)
+            doc = getdoc(method) or f"Prompt template {prompt_name}"
+            parameters = self._extract_parameters_from_signature(sig, method)
+            categories = self._extract_prompt_categories(doc)
+            prompts.append({
+                "name": prompt_name,
+                "description": doc,
+                "inputSchema": parameters or {},
+                "categories": categories
+            })
+        return {"prompts": prompts}
+
+    def _extract_prompt_categories(self, doc: str) -> List[str]:
+        """Extract categories from a docstring.
+
+        Supports patterns:
+          Category: foo
+          Categories: foo, bar
+          [categories: foo, bar]
+          [category: foo]
+        Returns a list of lowercase trimmed category tokens.
+        """
+        if not doc:
+            return []
+        import re
+        lines = doc.splitlines()
+        cats = []
+        pattern_line = re.compile(r'^\s*Categor(?:y|ies):\s*(.+)$', re.IGNORECASE)
+        bracket_pattern = re.compile(r'\[(?:categor(?:y|ies)):\s*([^\]]+)\]', re.IGNORECASE)
+        for ln in lines:
+            m = pattern_line.match(ln)
+            if m:
+                cats.extend([c.strip().lower() for c in m.group(1).split(',') if c.strip()])
+            for b in bracket_pattern.findall(ln):
+                cats.extend([c.strip().lower() for c in b.split(',') if c.strip()])
+        # de-dup preserving order
+        seen = set()
+        out = []
+        for c in cats:
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out
+
+    def handle_prompt_get(self, request_id: Union[str, int, None], params: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle prompts/get: return a prompt description and message list.
+
+        Expected request shape:
+          {
+            "jsonrpc": "2.0",
+            "id": <id>,
+            "method": "prompts/get",
+            "params": { "name": "code_review", "arguments": { ... } }
+          }
+
+        Response shape (example):
+          {
+            "jsonrpc": "2.0",
+            "id": <id>,
+            "result": {
+              "description": "Code review prompt",
+              "messages": [ { "role": "user", "content": { "type": "text", "text": "..." } } ]
+            }
+          }
+
+        Semantics:
+          * The underlying method named prompt_<name> is introspected.
+          * Its docstring becomes the 'description'.
+          * If invoked (arguments supplied) and it returns:
+              - str: wrapped as a single user message with text content.
+              - list of message dicts already in {role, content{type,text}} form: used as-is.
+              - dict containing 'messages': those are used directly.
+              - any other object: JSON-serialized into a single user message.
+          * If no arguments provided: returns only description (no messages key) for lightweight discovery.
+        """
+        prompt_name = params.get('name')
+        if not prompt_name:
+            error = self.create_error(-32602, "Missing required parameter 'name'")
+            return self.create_response(request_id, None, error)
+        method_name = f"prompt_{prompt_name}"
+        if not hasattr(self, method_name):
+            error = self.create_error(-32601, f"Prompt not found: {prompt_name}")
+            return self.create_response(request_id, None, error)
+        method = getattr(self, method_name)
+        sig = signature(method)
+        doc = getdoc(method) or f"Prompt template {prompt_name}"
+        # Prepare invocation if arguments provided
+        arguments = params.get('arguments', {}) or {}
+        categories = self._extract_prompt_categories(doc)
+        result_body: Dict[str, Any] = { 'description': doc }
+        if categories:
+            result_body['categories'] = categories
+        if arguments:
+            try:
+                kwargs = {}
+                for p_name, p in sig.parameters.items():
+                    if p_name == 'self':
+                        continue
+                    if p_name in arguments:
+                        kwargs[p_name] = arguments[p_name]
+                    elif p.default != Parameter.empty:
+                        kwargs[p_name] = p.default
+                    else:
+                        raise ValueError(f"Missing required argument '{p_name}' for prompt {prompt_name}")
+                ret = method(**kwargs)
+                messages: Optional[List[Dict[str, Any]]] = None
+                if isinstance(ret, str):
+                    messages = [{
+                        'role': 'user',
+                        'content': { 'type': 'text', 'text': ret }
+                    }]
+                elif isinstance(ret, list) and all(isinstance(m, dict) and 'role' in m and 'content' in m for m in ret):
+                    messages = ret  # assume already in desired shape
+                elif isinstance(ret, dict) and 'messages' in ret and isinstance(ret['messages'], list):
+                    messages = ret['messages']
+                else:
+                    # Fallback: serialize arbitrary return
+                    # Fallback: serialize arbitrary return value
+                    messages = [{
+                        'role': 'user',
+                        'content': { 'type': 'text', 'text': dumps(ret, ensure_ascii=False) }
+                    }]
+                result_body['messages'] = messages
+            except (ValueError, TypeError) as e:
+                error = self.create_error(-32603, f"Prompt execution error: {e}")
+                return self.create_response(request_id, None, error)
+        return self.create_response(request_id, result_body, None)
+
     def _extract_parameters_from_signature(self, sig: signature, method) -> Dict[str, Any]:
         """Extract parameter schema from method signature and type hints."""
         # Get type hints for the method
@@ -124,7 +269,7 @@ class MCPServer:
         
         return {}
     
-    def _type_to_json_schema(self, param_type) -> Dict[str, Any]:
+    def _type_to_json_schema(self, param_type: Any) -> Dict[str, Any]:
         """Convert Python type annotation to JSON schema property."""
         if param_type is None or param_type == type(None):
             return {"type": "null"}
@@ -281,7 +426,7 @@ class MCPServer:
             "message": message
         }
     
-    def process_request(self, input_data: str) -> Dict[str, Any]:
+    def process_request(self, input_data: str) -> Optional[Dict[str, Any]]:
         """Process a JSON-RPC 2.0 request."""
         try:
             request = loads(input_data)
@@ -311,6 +456,11 @@ class MCPServer:
             return self.handle_tools_list(request_id)
         elif method == "tools/call":
             return self.handle_tools_call(request_id, params)
+        elif method == "prompts/list":
+            result = self.discover_prompts()
+            return self.create_response(request_id, result, None)
+        elif method == "prompts/get":
+            return self.handle_prompt_get(request_id, params)
         elif method == "notifications/initialized":
             # Don't invoke any response, just log it
             self.logger.info("Host confirmed toolContract reception with 'notifications/initialized'")
@@ -321,7 +471,7 @@ class MCPServer:
     
     # ==== Main execution ====
     
-    def run(self, args: list = None):
+    def run(self, args: Optional[List[str]] = None) -> None:
         """Run the MCP server."""
         if args is None:
             args = argv[1:]

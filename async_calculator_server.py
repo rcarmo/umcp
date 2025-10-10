@@ -140,6 +140,20 @@ class AsyncCalculatorMCPServer(AsyncMCPServer):
         except (ValueError, TypeError) as e:
             self.logger.error("Error in factorial operation: %s", e)
             return {"error": "Invalid input for factorial"}
+    
+    def prompt_calculate_product(self, a: float, b: float) -> str:
+        """Generate a prompt for calculating the product of two numbers.
+        Categories: math, calculation
+        """
+        return f"What is the product of {a} and {b}?"
+
+    async def prompt_calculate_quotient(self, a: float, b: float) -> str:
+        """Generate a prompt for calculating the quotient of two numbers.
+        Categories: math, calculation
+        """
+        if b == 0:
+            return "Division by zero is not allowed."
+        return f"What is the result of dividing {a} by {b}?"
 
 
 if __name__ == "__main__":
