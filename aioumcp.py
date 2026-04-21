@@ -213,7 +213,7 @@ class AsyncMCPServer:
         properties = {}
         required = []
         for param in params:
-            param_type = type_hints.get(param.name)
+            param_type = type_hints.get(param.name, param.annotation)
             properties[param.name] = self._type_to_json_schema(param_type)
             if param.default == Parameter.empty:
                 required.append(param.name)
@@ -224,6 +224,8 @@ class AsyncMCPServer:
     
     def _type_to_json_schema(self, param_type: Any) -> Dict[str, Any]:
         """Convert Python type annotation to JSON schema property."""
+        if param_type == Parameter.empty:
+            return {"type": "string"}
         if param_type is None or param_type == type(None):
             return {"type": "null"}
         elif param_type is str:

@@ -235,7 +235,7 @@ class MCPServer:
         # Get type hints for the method
         try:
             type_hints = get_type_hints(method)
-        except (NameError, AttributeError):
+        except (NameError, AttributeError, TypeError):
             type_hints = {}
         
         # Skip 'self' parameter only
@@ -250,7 +250,7 @@ class MCPServer:
         required = []
         
         for param in params:
-            param_type = type_hints.get(param.name)
+            param_type = type_hints.get(param.name, param.annotation)
             
             prop_def = self._type_to_json_schema(param_type)
             properties[param.name] = prop_def
@@ -271,6 +271,8 @@ class MCPServer:
     
     def _type_to_json_schema(self, param_type: Any) -> Dict[str, Any]:
         """Convert Python type annotation to JSON schema property."""
+        if param_type == Parameter.empty:
+            return {"type": "string"}
         if param_type is None or param_type == type(None):
             return {"type": "null"}
         elif param_type is str:
