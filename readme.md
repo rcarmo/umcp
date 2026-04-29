@@ -1,4 +1,4 @@
-# 🐚 MicroMCP
+# 🐚 umcp
 
 A lightweight, zero-dependency implementation of the [Model Context
 Protocol (MCP)](https://modelcontextprotocol.io) in pure Python --
@@ -67,7 +67,7 @@ cd umcp
 python examples/movie_server.py --help
 ```
 
-No additional packages required -- MicroMCP uses only the Python
+No additional packages required -- `umcp` uses only the Python
 standard library.
 
 ---
@@ -241,10 +241,10 @@ example for what a production deployment of `umcp` looks like.
 
 ## 📝 Prompt templates
 
-MicroMCP supports reusable prompt templates using the same naming
+`umcp` supports reusable prompt templates using the same naming
 convention as tools: methods named `prompt_<name>` are discovered and
 exposed via the MCP `prompts/list` and `prompts/get` methods. See
-[`PROMPTS.md`](PROMPTS.md) for the full reference.
+[`docs/PROMPTS.md`](docs/PROMPTS.md) for the full reference.
 
 Quick example:
 
@@ -382,8 +382,8 @@ umcp/
 ├── tests/                 -- pytest suite
 ├── docs/
 │   ├── ARCHITECTURE.md    -- design, transports, schema generation
-│   └── CHAINING.md        -- chaining patterns for MCP server authors
-├── PROMPTS.md             -- prompt template reference
+│   ├── CHAINING.md        -- chaining patterns for MCP server authors
+│   └── PROMPTS.md         -- prompt template reference
 ├── readme.md              -- this file
 └── LICENSE
 ```
@@ -478,7 +478,7 @@ if __name__ == "__main__":
   [`python-office-mcp-server`][office] as the worked example. Read
   this before building anything non-trivial; it's where the real
   reliability work lives.
-* [`PROMPTS.md`](PROMPTS.md) -- prompt template reference.
+* [`docs/PROMPTS.md`](docs/PROMPTS.md) -- prompt template reference.
 * [`python-office-mcp-server`][office] -- production-grade MCP server
   built on `umcp`, with 100+ tools for Word/Excel/PowerPoint editing.
 

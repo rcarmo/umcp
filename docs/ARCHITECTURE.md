@@ -10,7 +10,7 @@ JSON-RPC 2.0 protocol over one of three transports.
 This document covers what's in there and why. For chaining patterns and
 recommendations for how MCP servers should *behave* once they're built,
 see [`CHAINING.md`](CHAINING.md). For prompt templates specifically,
-see [`PROMPTS.md`](../PROMPTS.md).
+see [`PROMPTS.md`](PROMPTS.md).
 
 [mcp]: https://modelcontextprotocol.io
 
@@ -216,7 +216,7 @@ field.
 `prompts/list` and `prompts/get` are the two relevant MCP methods,
 both implemented. The return value of a prompt method can be a string
 (returned as a single user message), a list (returned as a sequence of
-messages), or a dict (returned verbatim). See [`PROMPTS.md`](../PROMPTS.md)
+messages), or a dict (returned verbatim). See [`PROMPTS.md`](PROMPTS.md)
 for the full prompt API and examples.
 
 ## Server-level configuration and instructions
@@ -297,8 +297,8 @@ umcp/
   docs/
     ARCHITECTURE.md          -- this file
     CHAINING.md              -- patterns for chaining MCP tool calls
+    PROMPTS.md               -- prompt template documentation
 
-  PROMPTS.md                 -- prompt template documentation
   readme.md                  -- quick-start and API reference
   LICENSE                    -- MIT
 ```
