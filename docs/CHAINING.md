@@ -365,7 +365,7 @@ in the docstring.
 
 ## Annotations let planners parallelise
 
-The annotations the upstreamed `aioumcp.py` now emits (`readOnlyHint`,
+The annotations `aioumcp.py` emits (`readOnlyHint`,
 `destructiveHint`, `openWorldHint`) aren't just metadata -- they're
 scheduling hints. A planner can run all read-only calls in parallel
 during discovery, serialise destructive calls behind a confirmation, and
@@ -378,7 +378,7 @@ cause of "why did the model just delete my doc?" incidents.
 
 ## Strictness keeps chains from drifting
 
-The fork's `aioumcp.py` rejects unknown arguments outright. Sounds
+The current `aioumcp.py` rejects unknown arguments outright. Sounds
 unfriendly until you've watched a model invent a `force=True` parameter
 your tool silently ignores, then write a confident summary saying it
 forced the operation.
@@ -387,7 +387,7 @@ Strict argument validation forces a visible error early in the chain,
 gives the model a concrete signal to consult `office_help` or the
 schema, and prevents silent drift between what the model thinks
 happened and what did. Pair it with `additionalProperties: false` on
-every input schema (also now upstream) and your tool contracts become
+every input schema and your tool contracts become
 genuinely contractual.
 
 ## How the design got there
@@ -474,7 +474,7 @@ A flat reference, loosely ordered by payoff:
 | `Literal[...]` enums for operation/mode/check arguments | throughout | Become real JSON-Schema `enum`s, so the model sees the closed set instead of guessing. |
 | Symbolic addressing (`section:Name`, `after:Heading`, `slide:1/Title 1`, `'Sheet'!B5`) | `tool_office_patch`, `tool_word_insert_at_anchor` | Addresses the model can already see in its own prior turn. |
 | Map / anchor discovery (`word_list_anchors`, `word_document_map`, `office_inspect`) | `tools/word_advanced_tools.py`, `tools/office_unified_tools.py` | Returns the addresses the addressing layer accepts. |
-| Strict unknown-arg rejection + `additionalProperties: false` | `aioumcp.py` (now upstream) | Stops silent drift when models invent parameters. |
+| Strict unknown-arg rejection + `additionalProperties: false` | `aioumcp.py` | Stops silent drift when models invent parameters. |
 | Type coercion for stringy clients | `aioumcp.py::_coerce_value` | Some clients send numbers as strings; coerce rather than fail. |
 | Deprecated-tool hiding (`DEPRECATED_TOOLS` filtered from `tools/list`) | `office_server.py` | Keeps the surface area small without deleting code. |
 | File-fingerprint metadata cache | `tools/metadata_cache.py` | Cheap recovery loops via `(path, mtime_ns, size, sha256)` keys, schema versioning, atomic writes. |
