@@ -589,6 +589,21 @@ class AsyncMCPServer:
                 # Map from arguments dict to individual parameters
                 params_list = [p for name, p in sig.parameters.items() if name != 'self']
 
+                # Reject unknown parameters to keep tool contracts strict
+                # (applies even when the tool takes no parameters at all).
+                allowed_params = {
+                    param_name for param_name in sig.parameters
+                    if param_name != 'self'
+                }
+                unknown_params = sorted(
+                    key for key in arguments
+                    if key not in allowed_params
+                )
+                if unknown_params:
+                    raise ValueError(
+                        "Unrecognized parameter(s): " + ", ".join(unknown_params)
+                    )
+
                 if len(params_list) == 0:
                     # No parameters - call method based on whether it's async
                     self.logger.info("TOOL EXEC: %s (no params, async=%s)", tool_name, iscoroutinefunction(method))
@@ -604,20 +619,6 @@ class AsyncMCPServer:
                         type_hints = get_type_hints(method)
                     except (NameError, AttributeError, TypeError):
                         type_hints = {}
-
-                    # Reject unknown parameters to keep tool contracts strict.
-                    allowed_params = {
-                        param_name for param_name in sig.parameters
-                        if param_name != 'self'
-                    }
-                    unknown_params = sorted(
-                        key for key in arguments
-                        if key not in allowed_params
-                    )
-                    if unknown_params:
-                        raise ValueError(
-                            "Unrecognized parameter(s): " + ", ".join(unknown_params)
-                        )
 
                     kwargs = {}
                     for param_name, param in sig.parameters.items():
