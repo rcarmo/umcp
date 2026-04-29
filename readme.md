@@ -21,7 +21,7 @@ A lightweight, zero-overhead implementation of [Model Context Protocol (MCP)](ht
 
 ## 🔧 Requirements
 
-- Python 3.7+
+- Python 3.10+ (the async server uses PEP 604 unions and `types.UnionType`; the sync server still works on 3.7+)
 
 ---
 
