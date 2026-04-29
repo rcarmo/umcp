@@ -184,6 +184,100 @@ verbatim, they token-match `watch_for` strings against the next
 response, and they collapse a 100-tool planning frontier to a
 one-element `next_tools` list and just take it.
 
+## More ways into the catalogue
+
+`office_help` is the obvious entry point, but the office server treats
+discovery as a small surface in its own right rather than a single tool.
+Worth knowing what's actually there.
+
+The tool accepts three shapes of input. `goal="fill_sow_from_markdown"`
+is the canonical key. `goal="generate_statement_of_work"` is an alias
+resolved through a small `GOAL_ALIASES` synonym table -- so the
+plausible-but-wrong key still lands somewhere useful. `task="I need to
+write up a statement of work from these notes"` is free text,
+keyword-scored against a `TASK_KEYWORDS` table of `(goal, "space
+separated keywords")` tuples; the highest-scoring goal wins. The model
+can reach the same workflow via the structured key it learned from a
+prior call, the wrong synonym it guessed, or the messy English the user
+originally typed.
+
+Called with no arguments, `office_help()` returns the catalogue --
+`common_goals: [...]` plus the core tool list and the tier taxonomy --
+with a `next_step` telling the model to call again with a goal. So
+browsing is a single cheap call. Called with an unknown goal, it
+returns `supported_goals: [...]` rather than an error string. The
+failure response *is* the catalogue. This matters because models
+handle a typo gracefully when the next-turn input contains the right
+spelling; they don't when it just contains "error".
+
+Document type is inferred when not given. `_infer_document_type()`
+looks at the goal, the file extension, and the task text -- `"slide"`
+or `"deck"` lands on PowerPoint, `"workbook"` or `"cell"` on Excel,
+`"docx"` or `"section"` on Word. Saves the model a parameter it would
+otherwise have to either fill in or omit defensively.
+
+The response is shapeable. `format="detailed"` extends the payload
+with full `notes` and an explicit `workflow_steps` array (`"1. Start
+with X. 2. If needed, continue with Y. 3. Validate with Z."`); the
+default `summary` keeps it compact. `constraints=["preserve_template_structure"]`
+or `constraints=["additive_narrative_edits"]` re-rank the
+`recommended[]` list so the matching tools come first. The same goal
+produces different chains depending on caution level, which means the
+model doesn't need a separate "safe" goal for every existing one.
+
+Every `office_help` payload carries the tier taxonomy in a `tool_model`
+field: `core_tools`, plus `advanced_tool_classes` partitioned into
+`fallback`, `diagnostic`, `legacy_compatibility`, and
+`expert_specialized`. The model sees the philosophy on every call --
+not just *where* to go, but *which tier* the destination sits in. That
+turns out to matter, because a model that's just been told to prefer
+core tools will reliably ignore a `legacy_compatibility` entry it would
+otherwise have grabbed.
+
+Domain-specific recommenders sit alongside the global one.
+`pptx_recommend_layout(file_path, content_type)` is the worked example:
+it returns a scored choice, ranked alternatives, a copy-paste `usage:`
+string, and a `next_tools` hint. Other domains could grow their own
+(`excel_recommend_chart_type`, `word_recommend_section_target`) without
+disturbing the central catalogue. "Smart pickers" inside a domain are
+cheaper than asking the model to guess.
+
+Deprecated tools are hidden, not deleted. The `DEPRECATED_TOOLS` set in
+`office_server.py` filters legacy names out of `tools/list`, so the
+model never sees them in the catalogue. They still work if explicitly
+called, for backwards compatibility, but they're invisible to a fresh
+planner. Smaller surface, no broken integrations.
+
+The docstrings themselves are part of the discovery surface. Every
+consolidated tool carries a `Replaces:` line listing the legacy tools
+it subsumes and an `Examples:` block with three or four representative
+calls. Both are visible to the model through MCP's standard tool
+descriptions, so the catalogue teaches as it lists. The model that
+sees `office_audit`'s docstring saying *"Replaces:
+excel_audit_placeholders, word_audit_completion, word_audit_sow,
+pptx_audit_placeholders"* will not go looking for those names. Cheap
+lesson.
+
+### What deliberately isn't there
+
+The absences are as informative as the presences, because they're
+exactly the things a server author would reach for next.
+
+There's no `tools/search?q=...` over the catalogue. There's no
+`tools/describe(tool_name)` for fetching the full schema of a single
+tool on demand -- the model has to scan the `tools/list` payload.
+There's no semantic / embedding-based goal lookup; it's all keyword
+tables and aliases. There's no "tools related to this one" graph
+beyond the per-goal `related_tools[]` list. And there's no usage
+telemetry feeding back into the recommendations.
+
+The choice is consistent. The keyword table is small enough to
+maintain by hand and easy to read in a code review, which is the
+point -- discoverability that depends on a model the maintainer can't
+inspect tends to drift. If the catalogue ever outgrows hand-curation,
+a semantic layer is the obvious next move; until then, every routing
+decision is a line in a Python file.
+
 ## Addressing: anchors, not offsets
 
 The biggest reason chains break is the model losing the thread between
@@ -363,6 +457,13 @@ A flat reference, loosely ordered by payoff:
 | Technique | Where it lives | What it earns |
 |---|---|---|
 | Structured `office_help` (`recommended`/`why`/`fallbacks`/`next_step`/`watch_for`/`related_tools`/`notes`) | `tools/discovery_tools.py` (`WORKFLOW_GUIDANCE`) | Turns planning into a tool call. Highest payoff for small models. |
+| Free-text `task=` -> goal via keyword scoring + `goal=` aliases | `tools/discovery_tools.py` (`TASK_KEYWORDS`, `GOAL_ALIASES`) | Same workflow reachable from the canonical key, the wrong synonym, or messy English. |
+| No-arg `office_help()` returns the catalogue | `tools/discovery_tools.py` | Browsing is one cheap call. |
+| Unknown-goal response returns `supported_goals` | `tools/discovery_tools.py` | The failure response *is* the catalogue; models self-correct. |
+| `format="detailed"` and `constraints=[...]` re-shape the response | `tools/discovery_tools.py` | One goal, multiple chains, no extra goal entries. |
+| `tool_model.{core_tools,advanced_tool_classes}` carried in every help payload | `tools/discovery_tools.py` (`CORE_TOOLS`, `ADVANCED_TOOL_CLASSES`) | Tier philosophy visible on every call, not just in the README. |
+| Domain-specific recommenders with `usage:` and `next_tools` | `tools/pptx_advanced_tools.py` (`pptx_recommend_layout`) | "Smart pickers" inside a domain are cheaper than asking the model to guess. |
+| Docstring conventions (`Replaces:`, `Examples:`) | throughout | The catalogue teaches as it lists; models stop reaching for the names listed under `Replaces:`. |
 | `next_tools[]` and `usage:` in every mutating response | `tools/diagnostics.py`, various | Forward breadcrumbs at every node; `usage` is copy-paste-ready next-call text. |
 | Named diagnostic fields (`unmapped_sections`, `section_diagnostics`, `unmatched_targets`, `skipped_targets`) | `tools/word_advanced_tools.py`, `tools/diagnostics.py` | Makes failures visible to the model; `watch_for` token-matches the same strings. |
 | Standard mutation envelope (`success`/`status`/`warnings`/`matched_targets`/`unmatched_targets`/`skipped_targets`/`diagnostics`/`next_tools`) | `tools/diagnostics.py` | Branch on a `status` enum without reading prose. |
@@ -430,6 +531,10 @@ encourages.
 * Use *consistent prefixes* by surface (`word_`, `excel_`, `office_`).
 * Provide a *discovery tool* (`*_help`) that returns recommendations as
   a structured record, not as prose.
+* Make the discovery tool browseable -- no-arg call returns the
+  catalogue, unknown input returns the supported set.
+* Accept free-text input alongside structured keys, with a small
+  keyword/alias table doing the routing.
 * Embed forward breadcrumbs in every tool response: at minimum
   `next_tools: [...]`, plus `usage: "<exact call>"` whenever the
   current tool produced a value the next one needs.
