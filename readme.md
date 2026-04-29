@@ -8,14 +8,24 @@ A lightweight, zero-overhead implementation of [Model Context Protocol (MCP)](ht
 
 ## 📋 Features
 
-- ✅ Full JSON-RPC 2.0 protocol over stdio
-- ✅ Complete MCP protocol implementation
-- ✅ Dynamic tool discovery via function naming convention
-- ✅ Complete introspection of function signatures
-- ✅ Easy to extend with custom tools
+- ✅ Full JSON-RPC 2.0 protocol over stdio, SSE, or TCP
+- ✅ Complete MCP protocol implementation (tools, prompts, annotations)
+- ✅ Dynamic tool discovery via function naming convention (`tool_*`, `prompt_*`)
+- ✅ Complete introspection of function signatures, including `Literal`, `Union`, and `TypedDict`
+- ✅ MCP `inputSchema` generated automatically from type hints
+- ✅ Automatic `readOnlyHint` / `destructiveHint` / `openWorldHint` annotations from naming conventions
+- ✅ Strict argument validation (`additionalProperties: false`, unknown-arg rejection, type coercion for stringy clients)
 - ✅ Prompt templates for reusable, structured interactions
-- ✅ Both synchronous and asynchronous implementations
+- ✅ Both synchronous and asynchronous implementations -- pick by I/O shape (local disk vs. network)
 - ✅ Zero third-party dependencies
+
+---
+
+## 📚 Further reading
+
+* [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) -- design, transports, sync vs. async, schema generation, what's deliberately *not* included.
+* [`docs/CHAINING.md`](docs/CHAINING.md) -- how language models actually chain MCP tool calls in practice, with `python-office-mcp-server` as the worked example.
+* [`PROMPTS.md`](PROMPTS.md) -- prompt template reference and examples.
 
 ---
 
