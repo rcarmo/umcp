@@ -78,7 +78,7 @@ def test_introspected_movie_server():
     
     # Verify that book_ticket has proper parameters from introspection
     book_ticket_tool = next(tool for tool in tools if tool["name"] == "book_ticket")
-    params = book_ticket_tool["parameters"]
+    params = book_ticket_tool["inputSchema"]
     assert params["type"] == "object"
     assert "movie_id" in params["properties"]
     assert "show_time" in params["properties"] 
