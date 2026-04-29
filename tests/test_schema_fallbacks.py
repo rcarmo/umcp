@@ -40,9 +40,9 @@ def _tool_map(server):
 
 def test_sync_schema_falls_back_to_signature_annotation_and_string_default():
     tools = _tool_map(SyncSchemaFallbackServer())
-    assert tools['forward_ref']['parameters']['properties']['n']['type'] == 'string'
-    assert tools['unannotated']['parameters']['properties']['x']['type'] == 'string'
-    assert tools['typed']['parameters']['properties']['count']['type'] == 'integer'
+    assert tools['forward_ref']['inputSchema']['properties']['n']['type'] == 'string'
+    assert tools['unannotated']['inputSchema']['properties']['x']['type'] == 'string'
+    assert tools['typed']['inputSchema']['properties']['count']['type'] == 'integer'
 
 
 def test_async_schema_falls_back_to_signature_annotation_and_string_default():
