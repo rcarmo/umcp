@@ -1,10 +1,10 @@
 # 📝 Prompt Templates Guide
 
-This guide provides comprehensive documentation for implementing and using prompt templates in MicroMCP.
+This guide provides comprehensive documentation for implementing and using prompt templates in `umcp`.
 
 ## Overview
 
-Prompt templates in MicroMCP allow you to create reusable, structured prompt definitions that can be dynamically parameterized. They mirror the tool discovery system but return message scaffolds instead of tool results.
+Prompt templates in `umcp` allow you to create reusable, structured prompt definitions that can be dynamically parameterized. They mirror the tool discovery system but return message scaffolds instead of tool results.
 
 ## Basic Concepts
 
