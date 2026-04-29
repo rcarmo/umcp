@@ -8,6 +8,8 @@ from asyncio import gather, sleep
 from time import time
 from typing import Any, Dict, List
 
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from aioumcp import AsyncMCPServer
 
 

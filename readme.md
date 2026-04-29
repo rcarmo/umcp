@@ -1,8 +1,40 @@
 # 🐚 MicroMCP
 
-A lightweight, zero-overhead implementation of [Model Context Protocol (MCP)](https://modelcontextprotocol.io) in pure Python inspired by the original `bash` implementation by Muthukumaran Navaneethakrishnan.
+A lightweight, zero-dependency implementation of the [Model Context
+Protocol (MCP)](https://modelcontextprotocol.io) in pure Python --
+inspired by the original `bash` implementation by Muthukumaran
+Navaneethakrishnan.
 
-**Why?** I found the idea of using the simplest possible implementation of MCP in a shell script fascinating, but I wanted to see how it would look in Python with true introspection capabilities.
+**Why?** I found the idea of an MCP server written as a shell script
+fascinating, and wanted to see what the same idea looked like in Python
+with proper introspection -- type hints to JSON Schema, naming
+conventions to MCP annotations, no decorator boilerplate, and the whole
+thing readable in an afternoon.
+
+The library is two files (`umcp.py` and `aioumcp.py`), no third-party
+dependencies, supports stdio / SSE / TCP transports, and ships with a
+handful of runnable examples in [`examples/`](examples/).
+
+---
+
+## 📑 Table of contents
+
+* [Features](#-features)
+* [Requirements](#-requirements)
+* [Installation](#-installation)
+* [Quick start](#-quick-start)
+* [Architecture](#%EF%B8%8F-architecture)
+* [Getting started tutorial](#-getting-started-tutorial)
+* [Examples](#-examples)
+* [Prompt templates](#-prompt-templates)
+* [API reference](#-api-reference)
+* [Testing](#-testing)
+* [Development](#%EF%B8%8F-development)
+* [Integration (VS Code, Claude Desktop)](#-integration)
+* [Limitations](#-limitations)
+* [Troubleshooting](#-troubleshooting)
+* [Further reading](#-further-reading)
+* [License](#-license)
 
 ---
 
@@ -21,57 +53,46 @@ A lightweight, zero-overhead implementation of [Model Context Protocol (MCP)](ht
 
 ---
 
-## 📚 Further reading
-
-* [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) -- design, transports, sync vs. async, schema generation, what's deliberately *not* included.
-* [`docs/CHAINING.md`](docs/CHAINING.md) -- how language models actually chain MCP tool calls in practice, with `python-office-mcp-server` as the worked example.
-* [`PROMPTS.md`](PROMPTS.md) -- prompt template reference and examples.
-
----
-
 ## 🔧 Requirements
 
-- Python 3.10+ (both servers use PEP 604 unions and `types.UnionType`)
+- Python 3.10+ (both bases use PEP 604 unions and `types.UnionType`)
 
 ---
 
 ## 📦 Installation
 
-1. **Clone the repository**
-
 ```bash
 git clone https://github.com/rcarmo/umcp
 cd umcp
+python examples/movie_server.py --help
 ```
 
-2. **Verify installation**
-
-```bash
-python movie_server.py --help
-```
-
-No additional packages required - MicroMCP uses only the Python standard library!
+No additional packages required -- MicroMCP uses only the Python
+standard library.
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Quick start
 
-### 1. Try the Example Server
+### Try the example server
 
 ```bash
-echo '{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "get_movies"}, "id": 1}' | python ./movie_server.py
+echo '{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "get_movies"}, "id": 1}' \
+  | python ./examples/movie_server.py
 ```
 
-### 2. List Available Tools
+### List available tools
 
 ```bash
-echo '{"jsonrpc": "2.0", "method": "tools/list", "id": 1}' | python ./movie_server.py
+echo '{"jsonrpc": "2.0", "method": "tools/list", "id": 1}' \
+  | python ./examples/movie_server.py
 ```
 
-### 3. Try the Calculator
+### Try the calculator
 
 ```bash
-echo '{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "add", "arguments": {"a": 5, "b": 3}}, "id": 1}' | python ./calculator_server.py
+echo '{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "add", "arguments": {"a": 5, "b": 3}}, "id": 1}' \
+  | python ./examples/calculator_server.py
 ```
 
 ---
@@ -98,18 +119,21 @@ echo '{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "add", "argu
                                    └───────────────┘
 ```
 
+For the design details -- transports, sync vs. async rationale, schema
+generation, annotation inference, what's deliberately *not* included --
+see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 ---
 
-## 🎯 Getting Started Tutorial
+## 🎯 Getting started tutorial
 
-### Creating Your First MCP Server
+### Creating your first MCP server
 
 Create a file `my_server.py`:
 
 ```python
 #!/usr/bin/env python3
 from umcp import MCPServer
-from typing import Dict, Any, Optional
 
 class MyServer(MCPServer):
     """A simple example MCP server."""
@@ -142,22 +166,22 @@ if __name__ == "__main__":
     server.run()
 ```
 
-### Testing Your Server
+### Testing your server
 
 ```bash
-# Make it executable
 chmod +x my_server.py
 
-# Test the greet tool
 echo '{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "greet", "arguments": {"name": "Alice"}}, "id": 1}' | ./my_server.py
-
-# Test the add tool
 echo '{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "add_numbers", "arguments": {"a": 10, "b": 5}}, "id": 2}' | ./my_server.py
 ```
 
-### Async Version
+### Async version
 
-Create `async_server.py`:
+Use `AsyncMCPServer` from `aioumcp` instead, and make tool methods
+`async def`. Pick async when your tools talk to the network; pick sync
+when they talk to the local filesystem or run subprocesses. The
+[architecture doc](docs/ARCHITECTURE.md#two-implementations-one-shape)
+explains why both exist.
 
 ```python
 #!/usr/bin/env python3
@@ -167,16 +191,9 @@ from aioumcp import AsyncMCPServer
 class AsyncMyServer(AsyncMCPServer):
     """An async example MCP server."""
 
-    async def tool_fetch_data(self, url: str) -> Dict[str, Any]:
-        """Simulate fetching data from a URL.
-
-        Args:
-            url: The URL to fetch from
-
-        Returns:
-            Mock data response
-        """
-        await asyncio.sleep(0.1)  # Simulate network delay
+    async def tool_fetch_data(self, url: str) -> dict:
+        """Simulate fetching data from a URL."""
+        await asyncio.sleep(0.1)
         return {"url": url, "status": "success", "data": "mock response"}
 
 if __name__ == "__main__":
@@ -188,99 +205,91 @@ if __name__ == "__main__":
 
 ## 🔌 Examples
 
-This implementation includes two example servers that demonstrate how to use the MCP protocol:
+The runnable examples live under [`examples/`](examples/):
 
-### Movie Booking Server (`movie_server.py`)
-
-- Demonstrates CRUD operations
-- Shows parameter validation
-- Includes prompt templates for movie-related tasks
-
-### Calculator Server (`calculator_server.py`)
-
-- Simple mathematical operations
-- Error handling for edge cases
-- Type-safe parameter handling
-
-Both are supplied in synchronous and asynchronous versions, showcasing how to implement tools and introspection.
-
-### Running the Examples
+* [`examples/movie_server.py`](examples/movie_server.py) -- CRUD over an
+  in-memory store, parameter validation, prompt templates.
+* [`examples/calculator_server.py`](examples/calculator_server.py) --
+  pure compute, error handling, type-safe parameters.
+* [`examples/async_movie_server.py`](examples/async_movie_server.py) --
+  async version of the movie server.
+* [`examples/async_calculator_server.py`](examples/async_calculator_server.py)
+  -- async version of the calculator.
 
 ```bash
-# Synchronous versions
-python movie_server.py
-python calculator_server.py
+# Synchronous
+python examples/movie_server.py
+python examples/calculator_server.py
 
-# Asynchronous versions
-python async_movie_server.py
-python async_calculator_server.py
+# Asynchronous
+python examples/async_movie_server.py
+python examples/async_calculator_server.py
 ```
+
+### Production-grade example
+
+For a real, sizeable MCP server built on `umcp`, see
+[`rcarmo/python-office-mcp-server`][office] -- a Word/Excel/PowerPoint
+server with 100+ tools, structured workflow discovery, mutation
+diagnostics, and the chaining patterns documented in
+[`docs/CHAINING.md`](docs/CHAINING.md). It's the canonical worked
+example for what a production deployment of `umcp` looks like.
+
+[office]: https://github.com/rcarmo/python-office-mcp-server
 
 ---
 
-## 📝 Prompt Templates
+## 📝 Prompt templates
 
-MicroMCP supports reusable prompt templates using a simple naming convention. See [PROMPTS.md](PROMPTS.md) for detailed documentation.
+MicroMCP supports reusable prompt templates using the same naming
+convention as tools: methods named `prompt_<name>` are discovered and
+exposed via the MCP `prompts/list` and `prompts/get` methods. See
+[`PROMPTS.md`](PROMPTS.md) for the full reference.
 
-### Quick Overview
-
-- Any method named `prompt_<name>` is treated as a prompt definition
-- The method docstring becomes the prompt description
-- Function signature is introspected for JSON Schema input definition
-- Optional categories can be embedded in the docstring
-
-### Simple Example
+Quick example:
 
 ```python
 class MyServer(MCPServer):
     def prompt_code_review(self, filename: str, issues: int = 0) -> str:
-        """Generate a focused code review instruction.\nCategories: code, review"""
+        """Generate a focused code review instruction.
+        Categories: code, review"""
         return f"Please review '{filename}'. Assume ~{issues} pre-identified issues."
 ```
 
-### Testing Prompts
-
 ```bash
-# List available prompts
-echo '{"jsonrpc": "2.0", "method": "prompts/list", "id": 1}' | python ./movie_server.py
-
-# Get a specific prompt
-echo '{"jsonrpc": "2.0", "method": "prompts/get", "params": {"name": "code_review", "arguments": {"filename": "main.py"}}, "id": 2}' | python ./movie_server.py
+echo '{"jsonrpc": "2.0", "method": "prompts/list", "id": 1}' | python ./examples/movie_server.py
+echo '{"jsonrpc": "2.0", "method": "prompts/get", "params": {"name": "code_review", "arguments": {"filename": "main.py"}}, "id": 2}' | python ./examples/movie_server.py
 ```
 
 ---
 
-## 📚 API Reference
+## 📚 API reference
 
-### Core Classes
+### Core classes
 
-#### `MCPServer`
+#### `MCPServer` (`umcp.py`)
 
 Base class for synchronous MCP servers.
 
-**Key Methods:**
+* `discover_tools()` -- finds all `tool_*` methods on the subclass.
+* `discover_prompts()` -- finds all `prompt_*` methods on the subclass.
+* `handle_tools_call()` -- dispatches a tool call.
+* `handle_prompt_get()` -- dispatches a prompt fetch.
+* `get_config()` -- override to declare server name, version, capabilities.
+* `get_instructions()` -- override to give the model session-level guidance.
+* `run()` -- start the server on the configured transport (stdio by default; pass `--port N` for SSE, add `--tcp` for raw TCP).
 
-- `discover_tools()` - Automatically finds all `tool_*` methods
-- `discover_prompts()` - Automatically finds all `prompt_*` methods
-- `handle_tools_call()` - Dispatches tool execution
-- `handle_prompt_get()` - Handles prompt template retrieval
+#### `AsyncMCPServer` (`aioumcp.py`)
 
-#### `AsyncMCPServer`
+Same surface, but `tool_*` and `prompt_*` methods may be `async def`.
+Use this when your tools are network-bound; use `MCPServer` when
+they're local-disk or compute-bound.
 
-Base class for asynchronous MCP servers.
-
-**Key Methods:**
-
-- `discover_tools()` - Automatically finds all `tool_*` methods
-- `discover_prompts()` - Automatically finds all `prompt_*` methods
-- `handle_tools_call()` - Dispatches tool execution (async)
-- `handle_prompt_get()` - Handles prompt template retrieval (async)
-
-### Tool Method Signature
+### Tool method signature
 
 ```python
 def tool_<name>(self, param1: type1, param2: type2 = default) -> return_type:
-    """Tool description (first line becomes summary).
+    """Tool description (first line becomes the summary).
 
     Args:
         param1: Description of parameter 1
@@ -289,126 +298,94 @@ def tool_<name>(self, param1: type1, param2: type2 = default) -> return_type:
     Returns:
         Description of return value
     """
-    # Implementation
 ```
 
-### Prompt Method Signature
+### Prompt method signature
 
 ```python
 def prompt_<name>(self, param1: type1, param2: type2 = default) -> return_type:
-    """Prompt description.\nCategories: category1, category2"""
-    # Implementation returning str, list, or dict
+    """Prompt description.
+    Categories: category1, category2"""
 ```
+
+For schema generation rules (`Literal`, `Union`, `Optional`, `TypedDict`)
+and annotation inference, see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ---
 
 ## 🧪 Testing
 
-### Running Tests
-
 ```bash
-# Run all tests
+# All tests
 python -m pytest tests/
 
-# Run specific test files
+# Or with uv (recommended for a clean environment)
+uv run --with pytest --with pytest-asyncio --python 3.12 \
+  python -m pytest tests/
+
+# Specific files
 python -m pytest tests/test_introspection.py
 python -m pytest tests/test_prompts.py
 python -m pytest tests/test_async_prompts.py
 
-# Run with verbose output
+# Verbose
 python -m pytest tests/ -v
 ```
 
-### Test Coverage
-
-The test suite covers:
-
-- **Introspection**: Tool and prompt discovery
-- **Protocol Compliance**: JSON-RPC 2.0 implementation
-- **Synchronous Operations**: Tool execution and prompt handling
-- **Asynchronous Operations**: Async tool execution and prompt handling
-- **Error Handling**: Proper error responses and logging
-- **Performance**: Async vs sync comparisons
-
-### Writing Your Own Tests
-
-```python
-import subprocess
-import json
-
-def test_my_server():
-    # Test tool discovery
-    result = subprocess.run([
-        'echo', '{"jsonrpc": "2.0", "method": "tools/list", "id": 1}'
-    ], capture_output=True, text=True)
-
-    response = json.loads(result.stdout)
-    assert 'result' in response
-    assert 'tools' in response['result']
-```
+The suite covers tool/prompt discovery, JSON-RPC protocol compliance,
+sync and async dispatch, schema fallback behaviour, and round-trips the
+example servers as subprocesses to catch transport bugs.
 
 ---
 
 ## 🛠️ Development
 
-### Setting Up Development Environment
+### Setup
 
 ```bash
-# Clone the repository
 git clone https://github.com/rcarmo/umcp
 cd umcp
-
-# Create a virtual environment (optional but recommended)
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Run tests to verify everything works
 python -m pytest tests/
 ```
 
-### Code Style
+### Code style
 
-This project follows these conventions:
-
-- Explicit imports only
-- Functional programming style
-- Short, single-responsibility functions
-- Type hints for all parameters/returns
-- Double quotes for strings
-- Triple-double quote docstrings
-- `snake_case` method naming
-- f-strings only when needed
-- Logging over print statements
+* Explicit imports only.
+* Functional style; short, single-responsibility functions.
+* Type hints on all parameters and returns.
+* Double quotes for strings; triple-double-quote docstrings.
+* `snake_case` method naming.
+* f-strings only when needed.
+* Logging over print statements.
 
 ### Contributing
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature-name`
-3. Make your changes following the code style
-4. Add tests for new functionality
-5. Ensure all tests pass: `python -m pytest tests/`
-6. Submit a pull request
+1. Fork the repository.
+2. Create a feature branch: `git checkout -b feature-name`.
+3. Make your changes following the code style.
+4. Add tests for new functionality.
+5. Ensure all tests pass: `python -m pytest tests/`.
+6. Submit a pull request.
 
-### Project Structure
+### Project structure
 
 ```
 umcp/
-├── README.md              # This file
-├── LICENSE                # MIT License
-├── .github/
-│   └── copilot-instructions.md  # AI assistant guidelines
-├── umcp.py                # Synchronous MCP server base class
-├── aioumcp.py             # Asynchronous MCP server base class
-├── movie_server.py        # Example movie booking server
-├── async_movie_server.py  # Async version of movie server
-├── calculator_server.py   # Example calculator server
-├── async_calculator_server.py  # Async version of calculator
-├── tests/                 # Test suite
-│   ├── test_introspection.py
-│   ├── test_prompts.py
-│   ├── test_async_prompts.py
-│   └── ...
-└── PROMPTS.md             # Detailed prompt documentation
+├── umcp.py                -- sync MCPServer base class
+├── aioumcp.py             -- async AsyncMCPServer base class
+├── examples/              -- runnable example servers
+│   ├── movie_server.py
+│   ├── async_movie_server.py
+│   ├── calculator_server.py
+│   └── async_calculator_server.py
+├── tests/                 -- pytest suite
+├── docs/
+│   ├── ARCHITECTURE.md    -- design, transports, schema generation
+│   └── CHAINING.md        -- chaining patterns for MCP server authors
+├── PROMPTS.md             -- prompt template reference
+├── readme.md              -- this file
+└── LICENSE
 ```
 
 ---
@@ -416,8 +393,6 @@ umcp/
 ## 🔧 Integration
 
 ### VS Code & GitHub Copilot
-
-1. **Update VS Code settings.json**
 
 ```jsonc
 "mcp": {
@@ -434,15 +409,9 @@ umcp/
 }
 ```
 
-2. **Use with GitHub Copilot Chat**
-
-```
-/mcp my-weather-server get weather for New York
-```
+Then `/mcp my-weather-server get weather for New York` from Copilot Chat.
 
 ### Claude Desktop
-
-Add to your Claude Desktop configuration:
 
 ```json
 {
@@ -460,33 +429,35 @@ Add to your Claude Desktop configuration:
 
 ## 🚫 Limitations
 
-- No concurrency/parallel processing in synchronous version
-- No streaming responses
-- Not designed for high throughput
+* No streaming responses -- partial results aren't supported.
+* No built-in authentication -- the stdio transport is owned by the
+  host process; SSE/TCP bind to localhost. Front with a reverse proxy
+  if you need authenticated remote access.
+* No concurrency in the synchronous version -- one request at a time.
+  Use `AsyncMCPServer` if you need overlapping I/O.
 
-For AI assistants and local tool execution, these aren't blocking issues.
+For most AI-assistant / local-tool use cases, none of these are
+blocking. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#what-umcp-deliberately-doesnt-do)
+for the rationale.
 
 ---
 
 ## ❓ Troubleshooting
 
-### Common Issues
+**Server doesn't respond to JSON-RPC requests.** Check the JSON is
+valid and the server is running. Try a `tools/list` request first --
+it has no arguments and exercises the protocol path.
 
-**Q: Server doesn't respond to JSON-RPC requests**
-A: Check that your JSON is valid and that the server is running properly. Try testing with a simple tools/list request first.
+**Tools not showing up in `tools/list`.** Ensure the methods are
+named `tool_*` and have proper type hints. Check `mcpserver.log` next
+to the script for introspection errors.
 
-**Q: Tools not showing up in tools/list**
-A: Ensure your tool methods are named `tool_*` and have proper type hints. Check the server logs for any introspection errors.
+**Async server seems slow.** The async examples use `asyncio.sleep()`
+to simulate I/O. Remove these in real applications.
 
-**Q: Async server seems slow**
-A: The async examples use `asyncio.sleep()` to simulate I/O operations. In real applications, remove these delays.
+**Permission denied on the script.** `chmod +x your_server.py`.
 
-**Q: Permission denied on server script**
-A: Make the script executable: `chmod +x your_server.py`
-
-### Debug Mode
-
-Enable debug logging by setting the log level:
+**Debug logging.**
 
 ```python
 if __name__ == "__main__":
@@ -495,22 +466,31 @@ if __name__ == "__main__":
     server.run()
 ```
 
-### Getting Help
+---
 
-- Check the [test files](tests/) for working examples
-- Review the [prompt documentation](PROMPTS.md) for template guidance
-- Open an issue on GitHub for bugs or feature requests
+## 📚 Further reading
+
+* [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) -- design notes:
+  transports, sync vs. async rationale, schema generation, annotation
+  inference, what's deliberately not included.
+* [`docs/CHAINING.md`](docs/CHAINING.md) -- how language models
+  actually chain MCP tool calls in practice, with
+  [`python-office-mcp-server`][office] as the worked example. Read
+  this before building anything non-trivial; it's where the real
+  reliability work lives.
+* [`PROMPTS.md`](PROMPTS.md) -- prompt template reference.
+* [`python-office-mcp-server`][office] -- production-grade MCP server
+  built on `umcp`, with 100+ tools for Word/Excel/PowerPoint editing.
 
 ---
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT -- see [`LICENSE`](LICENSE).
 
 ---
 
 ## 🙏 Acknowledgments
 
-- Inspired by the original `bash` MCP implementation by Muthukumaran Navaneethakrishnan
-- Built on the [Model Context Protocol](https://modelcontextprotocol.io) specification
-- Thanks to all contributors and the MCP community
+* Inspired by the original `bash` MCP implementation by Muthukumaran Navaneethakrishnan.
+* Built against the [Model Context Protocol](https://modelcontextprotocol.io) specification.

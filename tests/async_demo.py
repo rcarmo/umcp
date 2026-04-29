@@ -4,6 +4,7 @@ async_demo.py - Live demonstration of async MCP server capabilities
 """
 
 import json
+import os
 import subprocess
 from time import time
 from typing import Tuple
@@ -16,7 +17,7 @@ def send_request(server_script: str, request: dict) -> Tuple[dict, float]:
     start_time = time()
     try:
         result = subprocess.run(
-            ["python3", server_script],
+            ["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples", server_script)],
             input=request_json,
             text=True,
             capture_output=True,

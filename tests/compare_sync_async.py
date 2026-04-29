@@ -4,6 +4,7 @@ compare_sync_async.py - Compare synchronous vs asynchronous MCP server performan
 """
 
 import json
+import os
 import subprocess
 import threading
 from time import time
@@ -17,7 +18,7 @@ def send_request(server_script: str, request: dict) -> tuple[dict, float]:
     start_time = time()
     try:
         result = subprocess.run(
-            ["python", server_script],
+            ["python", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples", server_script)],
             input=request_json,
             text=True,
             capture_output=True,
