@@ -6,6 +6,8 @@ Demonstrates pure Python MCP server without JSON configuration files
 
 from typing import Any, Dict
 
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from umcp import MCPServer
 
 

@@ -7,6 +7,8 @@ Demonstrates mixed sync/async tool implementation
 from asyncio import sleep
 from typing import Any, Dict
 
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from aioumcp import AsyncMCPServer
 
 

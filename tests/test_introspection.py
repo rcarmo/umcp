@@ -16,7 +16,7 @@ def send_request(server_script: str, request: Dict[str, Any]) -> Dict[str, Any]:
     
     try:
         # Use a relative path that works when run from the tests directory
-        script_path = "../" + server_script
+        script_path = "../examples/" + server_script
         print(f"DEBUG: Executing {sys.executable} {script_path}")
         print(f"DEBUG: Request: {request_json}")
         

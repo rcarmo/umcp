@@ -5,6 +5,7 @@ Demonstrates the performance benefits of async operations
 """
 
 import asyncio
+import os
 import json
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -17,7 +18,7 @@ def send_request(server_script: str, request: dict) -> dict:
     
     try:
         result = subprocess.run(
-            ["python", server_script],
+            ["python", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples", server_script)],
             input=request_json,
             text=True,
             capture_output=True,

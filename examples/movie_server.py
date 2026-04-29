@@ -6,6 +6,8 @@ movie_server.py - Movie business logic implementation
 from time import time
 from typing import Any, Dict, List, Optional
 
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from umcp import MCPServer
 
 
