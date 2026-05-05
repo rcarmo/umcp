@@ -48,6 +48,7 @@ from asyncio import (
     sleep,
     start_server,
 )
+from base64 import b64encode
 import re
 from inspect import (
     Parameter,
@@ -78,6 +79,14 @@ class AsyncMCPServer:
 
         # Set up logging
         self._setup_logging()
+
+        # Resource state.
+        self._resource_subscriptions: set[str] = set()
+        self._dynamic_resources: dict[str, tuple[dict[str, Any], Any]] = {}
+        self._dynamic_resource_templates: list[tuple[dict[str, Any], Any]] = []
+        # SSE session map -- populated by run_sse_async; declared here so
+        # notification helpers can introspect it from any context.
+        self._sse_sessions: dict[str, tuple[StreamWriter, Event]] = {}
 
     def _setup_logging(self) -> None:
         """Set up logging configuration."""
@@ -116,6 +125,10 @@ class AsyncMCPServer:
                 "prompts": {
                     "listChanged": True,
                     "get": True,
+                },
+                "resources": {
+                    "subscribe": True,
+                    "listChanged": True,
                 }
             },
             "instructions": self.get_instructions()
@@ -550,6 +563,350 @@ class AsyncMCPServer:
 
         return value
 
+    # ==== Resource discovery & handling ====
+    #
+    # Mirrors the synchronous implementation in umcp.py.  Resource methods
+    # may be ``def`` or ``async def``; the read handler awaits coroutine
+    # results.  See umcp.py for the full doc on naming, return-type
+    # normalisation, URI templates, and the optional ``_mcp_resource``
+    # override attribute.
+
+    _DEFAULT_TEXT_MIME = "text/plain"
+    _DEFAULT_BINARY_MIME = "application/octet-stream"
+
+    @staticmethod
+    def _resource_uri_template_to_regex(template: str) -> tuple[Any, list[str]]:
+        names: list[str] = []
+        pattern_parts: list[str] = []
+        cursor = 0
+        for m in re.finditer(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", template):
+            pattern_parts.append(re.escape(template[cursor:m.start()]))
+            names.append(m.group(1))
+            pattern_parts.append(f"(?P<{m.group(1)}>[^/]+)")
+            cursor = m.end()
+        pattern_parts.append(re.escape(template[cursor:]))
+        return re.compile("^" + "".join(pattern_parts) + "$"), names
+
+    def _default_resource_uri(self, name: str) -> str:
+        return f"umcp://{self.__class__.__name__}/{name}"
+
+    def _default_resource_template_uri(self, name: str, params: list[str]) -> str:
+        slots = "/".join("{" + p + "}" for p in params)
+        base = f"umcp://{self.__class__.__name__}/{name}"
+        return f"{base}/{slots}" if slots else base
+
+    def _resource_metadata(self, name: str, method: Any, params: list[str]) -> dict[str, Any]:
+        override = (
+            getattr(method, "_mcp_resource", None)
+            or getattr(method, "_mcp_resource_template", None)
+            or {}
+        )
+        doc = (getdoc(method) or "").strip()
+        description = override.get("description") or (doc.splitlines()[0] if doc else None)
+        meta: dict[str, Any] = {"name": override.get("name", name)}
+        if params:
+            meta["uriTemplate"] = override.get("uri_template") or self._default_resource_template_uri(name, params)
+        else:
+            meta["uri"] = override.get("uri") or self._default_resource_uri(name)
+        if override.get("title"):
+            meta["title"] = override["title"]
+        if description:
+            meta["description"] = description
+        if override.get("mime_type"):
+            meta["mimeType"] = override["mime_type"]
+        if override.get("size") is not None:
+            meta["size"] = override["size"]
+        if override.get("annotations"):
+            meta["annotations"] = dict(override["annotations"])
+        return meta
+
+    def _iter_resource_methods(self) -> list[tuple[str, Any]]:
+        out: list[tuple[str, Any]] = []
+        for member_name, method in getmembers(self, predicate=ismethod):
+            if member_name.startswith("resource_template_"):
+                continue
+            if not member_name.startswith("resource_"):
+                continue
+            out.append((member_name[len("resource_"):], method))
+        return out
+
+    def _iter_resource_template_methods(self) -> list[tuple[str, Any, list[str]]]:
+        out: list[tuple[str, Any, list[str]]] = []
+        for member_name, method in getmembers(self, predicate=ismethod):
+            if not member_name.startswith("resource_template_"):
+                continue
+            sig = signature(method)
+            params = [
+                p.name for p in sig.parameters.values()
+                if p.kind in (Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY)
+            ]
+            out.append((member_name[len("resource_template_"):], method, params))
+        return out
+
+    def discover_resources(self) -> dict[str, Any]:
+        """Return the ``resources/list`` payload for static resources."""
+        resources: list[dict[str, Any]] = []
+        for name, method in self._iter_resource_methods():
+            resources.append(self._resource_metadata(name, method, params=[]))
+        for meta, _callable in self._dynamic_resources.values():
+            resources.append(dict(meta))
+        return {"resources": resources}
+
+    def discover_resource_templates(self) -> dict[str, Any]:
+        """Return the ``resources/templates/list`` payload."""
+        templates: list[dict[str, Any]] = []
+        for name, method, params in self._iter_resource_template_methods():
+            templates.append(self._resource_metadata(name, method, params=params))
+        for meta, _callable in self._dynamic_resource_templates:
+            templates.append(dict(meta))
+        return {"resourceTemplates": templates}
+
+    def register_resource(
+        self,
+        uri: str,
+        callable_: Any,
+        *,
+        name: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        mime_type: str | None = None,
+        size: int | None = None,
+        annotations: dict[str, Any] | None = None,
+    ) -> None:
+        meta: dict[str, Any] = {"uri": uri, "name": name or uri}
+        if title:
+            meta["title"] = title
+        if description:
+            meta["description"] = description
+        if mime_type:
+            meta["mimeType"] = mime_type
+        if size is not None:
+            meta["size"] = size
+        if annotations:
+            meta["annotations"] = dict(annotations)
+        self._dynamic_resources[uri] = (meta, callable_)
+
+    def register_resource_template(
+        self,
+        uri_template: str,
+        callable_: Any,
+        *,
+        name: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        mime_type: str | None = None,
+        annotations: dict[str, Any] | None = None,
+    ) -> None:
+        meta: dict[str, Any] = {"uriTemplate": uri_template, "name": name or uri_template}
+        if title:
+            meta["title"] = title
+        if description:
+            meta["description"] = description
+        if mime_type:
+            meta["mimeType"] = mime_type
+        if annotations:
+            meta["annotations"] = dict(annotations)
+        self._dynamic_resource_templates.append((meta, callable_))
+
+    def _normalise_resource_content(
+        self, uri: str, default_mime: str | None, value: Any
+    ) -> list[dict[str, Any]]:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            data = bytes(value)
+            return [{
+                "uri": uri,
+                "mimeType": default_mime or self._DEFAULT_BINARY_MIME,
+                "blob": b64encode(data).decode("ascii"),
+            }]
+        if isinstance(value, str):
+            return [{
+                "uri": uri,
+                "mimeType": default_mime or self._DEFAULT_TEXT_MIME,
+                "text": value,
+            }]
+        if isinstance(value, dict):
+            entry = dict(value)
+            entry.setdefault("uri", uri)
+            if default_mime and "mimeType" not in entry:
+                entry["mimeType"] = default_mime
+            return [entry]
+        if isinstance(value, list):
+            out = []
+            for item in value:
+                if isinstance(item, dict):
+                    entry = dict(item)
+                    entry.setdefault("uri", uri)
+                    if default_mime and "mimeType" not in entry:
+                        entry["mimeType"] = default_mime
+                    out.append(entry)
+                else:
+                    out.extend(self._normalise_resource_content(uri, default_mime, item))
+            return out
+        return [{
+            "uri": uri,
+            "mimeType": default_mime or self._DEFAULT_TEXT_MIME,
+            "text": str(value),
+        }]
+
+    def handle_resources_list(
+        self, request_id: int | str | None, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self.create_response(request_id, self.discover_resources())
+
+    def handle_resources_templates_list(
+        self, request_id: int | str | None, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self.create_response(request_id, self.discover_resource_templates())
+
+    async def _maybe_await(self, value: Any) -> Any:
+        if iscoroutinefunction(getattr(value, "__call__", None)):  # safety
+            value = value()
+        if hasattr(value, "__await__"):
+            return await value
+        return value
+
+    async def handle_resources_read_async(
+        self, request_id: int | str | None, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Handle ``resources/read`` -- supports both sync and async resource methods."""
+        uri = params.get("uri")
+        if not uri:
+            error = self.create_error(-32602, "Missing 'uri' parameter")
+            return self.create_response(request_id, None, error)
+
+        async def call(method: Any, **kwargs: Any) -> Any:
+            result = method(**kwargs)
+            if hasattr(result, "__await__"):
+                result = await result
+            return result
+
+        for name, method in self._iter_resource_methods():
+            meta = self._resource_metadata(name, method, params=[])
+            if meta["uri"] == uri:
+                try:
+                    value = await call(method)
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.exception("Resource %s raised", uri)
+                    return self.create_response(
+                        request_id, None,
+                        self.create_error(-32603, f"Resource read failed: {exc}"),
+                    )
+                contents = self._normalise_resource_content(uri, meta.get("mimeType"), value)
+                return self.create_response(request_id, {"contents": contents})
+
+        if uri in self._dynamic_resources:
+            meta, fn = self._dynamic_resources[uri]
+            try:
+                value = await call(fn)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.exception("Resource %s raised", uri)
+                return self.create_response(
+                    request_id, None,
+                    self.create_error(-32603, f"Resource read failed: {exc}"),
+                )
+            contents = self._normalise_resource_content(uri, meta.get("mimeType"), value)
+            return self.create_response(request_id, {"contents": contents})
+
+        for name, method, params_list in self._iter_resource_template_methods():
+            meta = self._resource_metadata(name, method, params=params_list)
+            regex, _ = self._resource_uri_template_to_regex(meta["uriTemplate"])
+            m = regex.match(uri)
+            if m:
+                try:
+                    value = await call(method, **m.groupdict())
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.exception("Resource template %s raised", uri)
+                    return self.create_response(
+                        request_id, None,
+                        self.create_error(-32603, f"Resource read failed: {exc}"),
+                    )
+                contents = self._normalise_resource_content(uri, meta.get("mimeType"), value)
+                return self.create_response(request_id, {"contents": contents})
+
+        for meta, fn in self._dynamic_resource_templates:
+            regex, _ = self._resource_uri_template_to_regex(meta["uriTemplate"])
+            m = regex.match(uri)
+            if m:
+                try:
+                    value = await call(fn, **m.groupdict())
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.exception("Resource template %s raised", uri)
+                    return self.create_response(
+                        request_id, None,
+                        self.create_error(-32603, f"Resource read failed: {exc}"),
+                    )
+                contents = self._normalise_resource_content(uri, meta.get("mimeType"), value)
+                return self.create_response(request_id, {"contents": contents})
+
+        return self.create_response(
+            request_id, None,
+            self.create_error(-32002, "Resource not found", data={"uri": uri}),
+        )
+
+    def handle_resources_subscribe(
+        self, request_id: int | str | None, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        uri = params.get("uri")
+        if not uri:
+            return self.create_response(
+                request_id, None,
+                self.create_error(-32602, "Missing 'uri' parameter"),
+            )
+        self._resource_subscriptions.add(uri)
+        return self.create_response(request_id, {})
+
+    def handle_resources_unsubscribe(
+        self, request_id: int | str | None, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        uri = params.get("uri")
+        if not uri:
+            return self.create_response(
+                request_id, None,
+                self.create_error(-32602, "Missing 'uri' parameter"),
+            )
+        self._resource_subscriptions.discard(uri)
+        return self.create_response(request_id, {})
+
+    async def _send_notification_async(
+        self, method: str, params: dict[str, Any] | None = None
+    ) -> None:
+        """Emit a JSON-RPC notification on the active transport.
+
+        SSE: write to every connected session's StreamWriter.
+        Stdio / TCP / file mode: write one newline-delimited message to stdout.
+        """
+        notification: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            notification["params"] = params
+        payload_text = dumps(notification)
+
+        if self._sse_sessions:
+            sse_blob = f"event: message\ndata: {payload_text}\n\n".encode()
+            for sid, (writer, _evt) in list(self._sse_sessions.items()):
+                try:
+                    writer.write(sse_blob)
+                    await writer.drain()
+                except Exception:  # noqa: BLE001
+                    self.logger.debug("Dropping notification for stale SSE session %s", sid)
+            return
+
+        try:
+            _stdout_bin.write((payload_text + "\n").encode("utf-8"))
+            _stdout_bin.flush()
+        except Exception:  # noqa: BLE001
+            self.logger.exception("Failed to emit notification %s", method)
+
+    async def notify_resource_list_changed(self) -> None:
+        """Tell connected clients the resource list has changed."""
+        await self._send_notification_async("notifications/resources/list_changed")
+
+    async def notify_resource_updated(self, uri: str) -> None:
+        """Tell subscribed clients that *uri* has changed."""
+        if uri in self._resource_subscriptions:
+            await self._send_notification_async(
+                "notifications/resources/updated", {"uri": uri},
+            )
+
     # ==== Protocol handlers ====
 
     def handle_initialize(self, request_id: int, params: dict[str, Any]) -> dict[str, Any]:
@@ -738,6 +1095,16 @@ class AsyncMCPServer:
             return self.create_response(request_id, result)
         elif method == "prompts/get":
             return await self.handle_prompt_get_async(request_id, params)
+        elif method == "resources/list":
+            return self.handle_resources_list(request_id, params)
+        elif method == "resources/templates/list":
+            return self.handle_resources_templates_list(request_id, params)
+        elif method == "resources/read":
+            return await self.handle_resources_read_async(request_id, params)
+        elif method == "resources/subscribe":
+            return self.handle_resources_subscribe(request_id, params)
+        elif method == "resources/unsubscribe":
+            return self.handle_resources_unsubscribe(request_id, params)
         elif method == "notifications/initialized":
             self.logger.info("Host confirmed toolContract reception with 'notifications/initialized'")
             return None
@@ -949,6 +1316,10 @@ class AsyncMCPServer:
             { "type": "sse", "url": "http://127.0.0.1:<port>/sse" }
         """
         # Session registry: session_id -> (StreamWriter, disconnect_event)
+        # NB: ``_sse_sessions`` is also initialised in __init__ so that
+        # notification helpers can introspect it from any context, but we
+        # reset it here to ensure each ``run_sse_async`` invocation starts
+        # from a clean session map.
         self._sse_sessions: dict[str, tuple[StreamWriter, Event]] = {}
 
         server = await start_server(self._sse_handle_client, host, port)

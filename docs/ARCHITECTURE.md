@@ -219,6 +219,65 @@ both implemented. The return value of a prompt method can be a string
 messages), or a dict (returned verbatim). See [`PROMPTS.md`](PROMPTS.md)
 for the full prompt API and examples.
 
+## Resources
+
+Resources are the third discovery surface, alongside tools and prompts.
+The naming convention is `resource_<name>` for static resources and
+`resource_template_<name>` for parameterised ones; the parameter list of
+the templated method becomes the URI placeholders. The library handles
+all five `resources/*` JSON-RPC methods (`list`, `templates/list`,
+`read`, `subscribe`, `unsubscribe`) plus the two notifications
+(`notifications/resources/list_changed` and
+`notifications/resources/updated`), and declares the `resources`
+capability with `subscribe` and `listChanged` set to `true` on
+`initialize`.
+
+The URI is auto-generated as `umcp://<ServerClassName>/<name>` (or
+`umcp://<ServerClassName>/<name>/{p1}/{p2}` for templates), but a
+resource method can override that -- and the rest of its metadata --
+by attaching a `_mcp_resource` (or `_mcp_resource_template`) dict
+attribute. Supported keys are `uri` / `uri_template`, `name`, `title`,
+`description`, `mime_type`, `size`, and `annotations` (which carries
+`audience`, `priority`, `lastModified` per the spec).
+
+Return-type normalisation matters because the MCP `contents` schema is
+strict. The library accepts:
+
+* `str` -- becomes a single text content entry; `mimeType` defaults to
+  `text/plain`.
+* `bytes` (or `bytearray` / `memoryview`) -- becomes a binary content
+  entry with `blob` base64-encoded; `mimeType` defaults to
+  `application/octet-stream`.
+* `dict` -- treated as a single content entry; the resource URI is
+  filled in automatically if missing.
+* `list[dict]` -- multiple content entries (the MCP spec permits a
+  single resource to expand to several).
+
+URI template matching is deliberately simple: each `{name}` placeholder
+compiles to a named regex group that matches one path segment (no `/`).
+This covers the common case without dragging in a full RFC 6570
+implementation, and the captured groups are passed to the resource
+method as keyword arguments.
+
+For runtime registration, `register_resource(uri, callable, ...)` and
+`register_resource_template(uri_template, callable, ...)` add resources
+that aren't methods on the subclass. Useful when the resource set is
+data-driven (config files, items in a database) rather than known at
+import time.
+
+Notifications are best-effort and transport-aware:
+`notify_resource_list_changed()` fires unconditionally;
+`notify_resource_updated(uri)` only fires when at least one client has
+subscribed to that URI (the spec's intent -- there's no point in
+broadcasting changes nobody asked for). The async base exposes both as
+coroutines (`await self.notify_resource_updated(...)`); the sync base
+as plain methods. Both write SSE messages to every connected session
+when SSE is the active transport, and fall back to a single
+newline-delimited message on stdout for stdio / TCP / file mode.
+
+Unknown URIs return JSON-RPC error `-32002` with the URI in the `data`
+field, matching the spec's error-handling guidance.
+
 ## Server-level configuration and instructions
 
 Two methods are intended for subclasses to override.
@@ -281,10 +340,13 @@ umcp/
   umcp.py                    -- sync MCPServer base class
   aioumcp.py                 -- async AsyncMCPServer base class
 
-  movie_server.py            -- example: CRUD over an in-memory store
-  async_movie_server.py      -- async version of the same
-  calculator_server.py       -- example: pure compute
-  async_calculator_server.py -- async version of the same
+  examples/                  -- runnable example servers
+    movie_server.py            -- CRUD over an in-memory store
+    async_movie_server.py      -- async version of the same
+    calculator_server.py       -- pure compute, type-safe params
+    async_calculator_server.py -- async version of the same
+    resource_server.py         -- static + templated MCP resources
+    async_resource_server.py   -- async version of the resource server
 
   tests/                     -- pytest suite covering both bases
     test_introspection.py    -- discovery, schema generation, annotations
@@ -292,6 +354,7 @@ umcp/
     test_async_prompts.py    -- prompt discovery and dispatch (async)
     test_async_servers.py    -- end-to-end async transport tests
     test_movieserver.py      -- worked-example end-to-end test
+    test_resources.py        -- resources/* coverage for both bases
     test_schema_fallbacks.py -- exotic-type schema fallback behaviour
 
   docs/
