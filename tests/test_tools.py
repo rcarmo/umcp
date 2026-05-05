@@ -140,13 +140,12 @@ def test_call_with_scalar_returns_are_stringified() -> None:
     assert _content_text(_call_sync(s, "returns_bool")).lower() in {"true", "1"}
 
 
-def test_call_with_none_return_currently_errors() -> None:
-    """Documents the current behaviour: a tool returning ``None`` is wrapped
-    as a -32603 by the library, not as an empty content list.  This is more
-    of a regression marker than a desired contract -- if the library is ever
-    taught to handle ``None`` cleanly, this test should be relaxed."""
+def test_call_with_none_return_serialises_as_json_null() -> None:
+    """A tool returning ``None`` should still succeed and round-trip as JSON
+    ``null`` rather than surfacing as an execution error."""
     resp = _call_sync(_Sync(), "returns_none")
-    assert ("error" in resp) or ("content" in resp["result"])
+    assert "error" not in resp
+    assert _content_text(resp) == "null"
 
 
 def test_call_uses_default_when_argument_omitted() -> None:
@@ -165,16 +164,13 @@ def test_call_with_no_args_section_at_all() -> None:
 
 def test_listed_tools_can_all_be_called_round_trip() -> None:
     """Every tool advertised by tools/list with no required args should
-    be dispatchable. Skips ``returns_none`` because of the documented
-    None-return quirk above."""
+    be dispatchable."""
     s = _Sync()
     listed = s.discover_tools()["tools"]
     for tool in listed:
         # Skip tools that need required args we don't know how to fill.
         required = tool["inputSchema"].get("required", [])
         if required:
-            continue
-        if tool["name"] == "returns_none":
             continue
         resp = _call_sync(s, tool["name"])
         assert "error" not in resp, f"{tool['name']} failed: {resp}"

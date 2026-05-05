@@ -51,13 +51,10 @@ def test_prompts_list():
     assert 'code' in code_review.get('categories', [])
 
 
-def test_prompts_get_description_only():
+def test_prompts_get_missing_required_argument_returns_invalid_params():
     server = PromptTestServer()
-    # Call without arguments -> description only
     resp = server.handle_prompt_get(1, {"name": "code_review"})
-    assert 'result' in resp
-    assert 'description' in resp['result']
-    assert 'messages' not in resp['result']
+    assert resp['error']['code'] == -32602
 
 
 def test_prompts_get_with_arguments():
@@ -82,7 +79,7 @@ if __name__ == '__main__':  # Manual run helper
     # Run tests manually without pytest
     tests = [
         test_prompts_list,
-        test_prompts_get_description_only,
+        test_prompts_get_missing_required_argument_returns_invalid_params,
         test_prompts_get_with_arguments,
         test_prompts_get_list_messages,
     ]

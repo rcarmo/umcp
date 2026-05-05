@@ -113,35 +113,27 @@ def test_prompts_get_list_return_passes_messages_through() -> None:
     assert "main.py" in json.dumps(msgs)
 
 
-def test_prompts_get_dict_return_passes_description_through() -> None:
-    """A prompt method returning a dict has its top-level fields surfaced
-    in the prompts/get result. The exact handling of ``messages`` is a
-    library implementation detail; the description is the stable contract."""
+def test_prompts_get_dict_return_preserves_top_level_fields() -> None:
+    """A prompt method returning a dict with ``messages`` should be merged
+    into the result rather than stringified or reduced to description-only."""
     s = _Sync()
     resp = _send(s, {
         "jsonrpc": "2.0", "id": 1, "method": "prompts/get",
         "params": {"name": "verbatim"},
     })
     assert "error" not in resp
-    # Either the dict is used verbatim (description appears) or it gets
-    # wrapped in a single message; both shapes are accepted.
     result = resp["result"]
-    assert ("description" in result) or ("messages" in result)
+    assert result.get("description") == "verbatim"
+    assert result["messages"][0]["role"] == "user"
 
 
-def test_prompts_get_missing_required_argument_currently_does_not_validate() -> None:
-    """Documents the current behaviour: prompts/get does not enforce the
-    ``required`` schema keys before dispatch, unlike tools/call. If the
-    library is ever taught to validate prompt args, this test should
-    flip to expecting an error in the response."""
+def test_prompts_get_missing_required_argument_returns_invalid_params() -> None:
     s = _Sync()
     resp = _send(s, {
         "jsonrpc": "2.0", "id": 1, "method": "prompts/get",
         "params": {"name": "summarise", "arguments": {}},
     })
-    # Either an error or a result -- both are observable behaviours; just
-    # assert the server didn't crash and produced *some* response.
-    assert ("error" in resp) or ("result" in resp)
+    assert resp["error"]["code"] == -32602
 
 
 def test_prompts_get_unknown_name_returns_error() -> None:
@@ -150,6 +142,14 @@ def test_prompts_get_unknown_name_returns_error() -> None:
         "params": {"name": "no_such_prompt", "arguments": {}},
     })
     assert "error" in resp
+
+
+def test_prompts_get_unknown_argument_returns_invalid_params() -> None:
+    resp = _send(_Sync(), {
+        "jsonrpc": "2.0", "id": 1, "method": "prompts/get",
+        "params": {"name": "summarise", "arguments": {"text": "hi", "force": True}},
+    })
+    assert resp["error"]["code"] == -32602
 
 
 def test_initialize_declares_prompts_capability() -> None:
@@ -190,12 +190,11 @@ def test_async_prompt_with_async_return() -> None:
 
 
 def test_async_base_supports_sync_prompt_methods() -> None:
-    """A sync prompt method on an async server is at least dispatchable
-    without crashing. The exact response shape (messages list vs.
-    description-only) is a library detail."""
     resp = _send_async(_Async(), {
         "jsonrpc": "2.0", "id": 1, "method": "prompts/get",
         "params": {"name": "sync_in_async_base"},
     })
     assert "error" not in resp
-    assert "result" in resp
+    text = resp["result"]["messages"][0]["content"]
+    body = text["text"] if isinstance(text, dict) else text
+    assert body == "sync result"
