@@ -27,6 +27,7 @@ handful of runnable examples in [`examples/`](examples/).
 * [Getting started tutorial](#-getting-started-tutorial)
 * [Examples](#-examples)
 * [Prompt templates](#-prompt-templates)
+* [Resources](#-resources)
 * [API reference](#-api-reference)
 * [Testing](#-testing)
 * [Development](#%EF%B8%8F-development)
@@ -41,8 +42,8 @@ handful of runnable examples in [`examples/`](examples/).
 ## 📋 Features
 
 - ✅ Full JSON-RPC 2.0 protocol over stdio, SSE, or TCP
-- ✅ Complete MCP protocol implementation (tools, prompts, annotations)
-- ✅ Dynamic tool discovery via function naming convention (`tool_*`, `prompt_*`)
+- ✅ Complete MCP protocol implementation (tools, prompts, **resources**, annotations)
+- ✅ Dynamic discovery via function naming convention (`tool_*`, `prompt_*`, `resource_*`, `resource_template_*`)
 - ✅ Complete introspection of function signatures, including `Literal`, `Union`, and `TypedDict`
 - ✅ MCP `inputSchema` generated automatically from type hints
 - ✅ Automatic `readOnlyHint` / `destructiveHint` / `openWorldHint` annotations from naming conventions
@@ -211,10 +212,15 @@ The runnable examples live under [`examples/`](examples/):
   in-memory store, parameter validation, prompt templates.
 * [`examples/calculator_server.py`](examples/calculator_server.py) --
   pure compute, error handling, type-safe parameters.
+* [`examples/resource_server.py`](examples/resource_server.py) --
+  static and templated MCP resources, plus tools that mutate them and
+  emit `notifications/resources/updated`.
 * [`examples/async_movie_server.py`](examples/async_movie_server.py) --
   async version of the movie server.
 * [`examples/async_calculator_server.py`](examples/async_calculator_server.py)
   -- async version of the calculator.
+* [`examples/async_resource_server.py`](examples/async_resource_server.py)
+  -- async version of the resource server.
 
 ```bash
 # Synchronous
@@ -263,6 +269,71 @@ echo '{"jsonrpc": "2.0", "method": "prompts/get", "params": {"name": "code_revie
 
 ---
 
+## 📁 Resources
+
+`umcp` implements the [MCP resources spec][mcp-resources]: methods named
+`resource_<name>` are exposed as static resources, and methods named
+`resource_template_<name>` become parameterised resource templates whose
+signature parameters fill in the URI placeholders.
+
+The MCP capability is declared automatically on `initialize` --
+`{"resources": {"subscribe": true, "listChanged": true}}` -- and the
+following methods are wired through:
+
+* `resources/list` -- returns every `resource_*` method, plus anything
+  registered via `register_resource()`.
+* `resources/templates/list` -- every `resource_template_*` method, plus
+  `register_resource_template()`.
+* `resources/read` -- looks up by URI; static resources match by exact
+  URI, templates by `{placeholder}` regex.  Returns `-32002` with the URI
+  in `data` for unknown resources, per spec.
+* `resources/subscribe` / `resources/unsubscribe` -- track URIs of
+  interest.
+
+Return types are normalised into MCP `contents` entries:
+
+* `str` → text content (`text` + `mimeType`, default `text/plain`).
+* `bytes` → binary content (base64-encoded `blob`, default `application/octet-stream`).
+* `dict` → a single content entry, with `uri` filled in if missing.
+* `list[dict]` → multiple content entries.
+
+Attach `_mcp_resource = {...}` (or `_mcp_resource_template = {...}`) to a
+resource method to override the auto-generated `uri` / `uri_template`,
+set a `title`, `description`, `mime_type`, `size`, or annotations
+(`audience`, `priority`, `lastModified`).
+
+Mutating tools should call `notify_resource_updated(uri)` (only fires
+for URIs the client has subscribed to) and/or
+`notify_resource_list_changed()` after they change resource state.  In
+the async base these helpers are coroutines (`await
+self.notify_resource_updated(...)`).
+
+Quick example:
+
+```python
+class MyServer(MCPServer):
+    def resource_motd(self) -> str:
+        """Message of the day."""
+        return "Hello!"
+    resource_motd._mcp_resource = {"mime_type": "text/plain", "title": "MOTD"}
+
+    def resource_template_user(self, user_id: str) -> dict:
+        """Synthesised user profile."""
+        return {"mimeType": "application/json",
+                "text": f'{{"id": "{user_id}"}}'}
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"resources/list"}' | python examples/resource_server.py
+echo '{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"umcp://ResourceServer/motd"}}' | python examples/resource_server.py
+echo '{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"file:///hello.txt"}}' | python examples/resource_server.py
+```
+
+[mcp-resources]: https://modelcontextprotocol.io/specification/2025-11-25/server/resources
+
+
+---
+
 ## 📚 API reference
 
 ### Core classes
@@ -273,6 +344,14 @@ Base class for synchronous MCP servers.
 
 * `discover_tools()` -- finds all `tool_*` methods on the subclass.
 * `discover_prompts()` -- finds all `prompt_*` methods on the subclass.
+* `discover_resources()` / `discover_resource_templates()` -- finds all
+  `resource_*` and `resource_template_*` methods on the subclass.
+* `register_resource(uri, callable, ...)` /
+  `register_resource_template(uri_template, callable, ...)` -- runtime
+  registration of resources/templates.
+* `notify_resource_updated(uri)` /
+  `notify_resource_list_changed()` -- emit MCP notifications when
+  resource state changes.  In `AsyncMCPServer`, both are coroutines.
 * `handle_tools_call()` -- dispatches a tool call.
 * `handle_prompt_get()` -- dispatches a prompt fetch.
 * `get_config()` -- override to declare server name, version, capabilities.
@@ -378,7 +457,9 @@ umcp/
 │   ├── movie_server.py
 │   ├── async_movie_server.py
 │   ├── calculator_server.py
-│   └── async_calculator_server.py
+│   ├── async_calculator_server.py
+│   ├── resource_server.py
+│   └── async_resource_server.py
 ├── tests/                 -- pytest suite
 ├── docs/
 │   ├── ARCHITECTURE.md    -- design, transports, schema generation
