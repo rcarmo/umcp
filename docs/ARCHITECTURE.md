@@ -371,22 +371,55 @@ files; the rest is examples, tests, and documentation.
 
 ## Testing notes
 
-The test suite runs against both bases via the same fixtures where
-possible. The two end-to-end suites (`test_movieserver.py`,
-`test_async_servers.py`) actually spawn the example servers as
-subprocesses and round-trip JSON-RPC requests, which catches transport
-and framing bugs the unit tests miss.
+The test suite is split into focused modules so failures point at one
+layer of the library at a time:
 
-The recommended runner, for a clean environment:
+* **Discovery / introspection** -- `test_introspection.py`,
+  `test_movieserver.py`, `test_schema_generation.py`, `test_schema_fallbacks.py`,
+  `test_annotations.py`. These exercise the `tool_*` discovery rules,
+  the type-hint to JSON Schema mapping, and the annotation inferrer.
+* **Wire protocol** -- `test_protocol_errors.py`, `test_coercion.py`.
+  These cover the JSON-RPC error paths (parse / version / method /
+  args / tool-raise) and the lenient stringy-client coercion.
+* **Prompts** -- `test_prompts.py`, `test_async_prompts.py`.
+* **Resources** -- `test_resources.py` (list/templates/read/subscribe/
+  unsubscribe / capability declaration / dynamic registration) and
+  `test_notifications.py` (which monkey-patches the binary stdout
+  buffer to assert that `notifications/resources/list_changed` and
+  `notifications/resources/updated` actually go out, and that
+  subscription gating works).
+* **Transports** -- `test_async_servers.py` (async stdio over
+  subprocess), `test_transports.py` (sync stdio, sync TCP, sync SSE
+  end-to-end).
+
+End-to-end suites spawn the example servers as subprocesses and
+round-trip JSON-RPC requests; this catches transport and framing bugs
+the unit tests can't see (Windows CRLF translation, blocking-stdout
+buffering, SSE event framing).
+
+A `Makefile` wraps the common operations:
+
+```
+make test            # full suite
+make test-fast       # -x -q for the inner loop
+make coverage        # coverage report on stdout
+make coverage-html   # writes htmlcov/index.html
+```
+
+The recommended hermetic runner:
 
 ```
 uv run --with pytest --with pytest-asyncio --python 3.12 \
   python -m pytest tests/
 ```
 
+A GitHub Actions workflow (`.github/workflows/tests.yml`) runs the same
+suite on Python 3.10, 3.11, and 3.12 for every push and pull request,
+and emits a coverage report on 3.12.
+
 The library targets Python 3.10 as a minimum (for `types.UnionType`)
-but is tested on 3.12 in CI. There's nothing version-specific beyond
-the union-syntax requirement.
+but the suite passes on 3.10 / 3.11 / 3.12 in CI. There's nothing
+version-specific beyond the union-syntax requirement.
 
 ## Extending the library
 
