@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 from io import BytesIO
+from queue import Queue
 
 import pytest
 
@@ -105,6 +106,37 @@ def test_sync_subscribe_via_protocol_then_notify(captured_stdout) -> None:
     assert notifs[0]["params"]["uri"] == "umcp://test/a"
 
 
+def test_sync_sse_updated_targets_only_subscribed_session() -> None:
+    """When SSE is active, resource updates should go only to sessions that
+    subscribed to that URI, not every connected client."""
+    s = _SyncNotifyServer()
+    q1: Queue = Queue()
+    q2: Queue = Queue()
+    s._sse_sessions = {"s1": q1, "s2": q2}
+    s._resource_session_subscriptions = {
+        "s1": {"umcp://x/a"},
+        "s2": {"umcp://x/b"},
+    }
+
+    s.notify_resource_updated("umcp://x/a")
+
+    payload1 = q1.get_nowait().decode("utf-8")
+    assert 'notifications/resources/updated' in payload1
+    assert q2.empty()
+
+
+def test_sync_sse_list_changed_broadcasts_to_all_sessions() -> None:
+    s = _SyncNotifyServer()
+    q1: Queue = Queue()
+    q2: Queue = Queue()
+    s._sse_sessions = {"s1": q1, "s2": q2}
+
+    s.notify_resource_list_changed()
+
+    assert 'notifications/resources/list_changed' in q1.get_nowait().decode("utf-8")
+    assert 'notifications/resources/list_changed' in q2.get_nowait().decode("utf-8")
+
+
 # ---------- Async -----------------------------------------------------------
 
 
@@ -132,3 +164,53 @@ def test_async_updated_gated_by_subscription(captured_stdout) -> None:
     notifs = _parse_notifications(captured_stdout)
     assert len(notifs) == 1
     assert notifs[0]["params"] == {"uri": "umcp://x/a"}
+
+
+class _FakeAsyncWriter:
+    """Minimal StreamWriter stand-in for notification tests."""
+
+    def __init__(self) -> None:
+        self.payloads: list[bytes] = []
+
+    def write(self, data: bytes) -> None:
+        self.payloads.append(data)
+
+    async def drain(self) -> None:
+        return None
+
+
+def test_async_sse_updated_targets_only_subscribed_session() -> None:
+    s = _AsyncNotifyServer()
+    w1 = _FakeAsyncWriter()
+    w2 = _FakeAsyncWriter()
+    s._sse_sessions = {
+        "s1": (w1, asyncio.Event(), asyncio.Lock()),
+        "s2": (w2, asyncio.Event(), asyncio.Lock()),
+    }
+    s._resource_session_subscriptions = {
+        "s1": {"umcp://x/a"},
+        "s2": {"umcp://x/b"},
+    }
+
+    asyncio.run(s.notify_resource_updated("umcp://x/a"))
+
+    assert len(w1.payloads) == 1
+    assert b'notifications/resources/updated' in w1.payloads[0]
+    assert w2.payloads == []
+
+
+def test_async_sse_list_changed_broadcasts_to_all_sessions() -> None:
+    s = _AsyncNotifyServer()
+    w1 = _FakeAsyncWriter()
+    w2 = _FakeAsyncWriter()
+    s._sse_sessions = {
+        "s1": (w1, asyncio.Event(), asyncio.Lock()),
+        "s2": (w2, asyncio.Event(), asyncio.Lock()),
+    }
+
+    asyncio.run(s.notify_resource_list_changed())
+
+    assert len(w1.payloads) == 1
+    assert len(w2.payloads) == 1
+    assert b'notifications/resources/list_changed' in w1.payloads[0]
+    assert b'notifications/resources/list_changed' in w2.payloads[0]

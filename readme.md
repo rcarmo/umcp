@@ -435,7 +435,7 @@ python -m pytest tests/test_resources.py -v
 | `test_transports.py` | sync stdio, sync TCP, sync SSE end-to-end |
 | `simple_async_test.py` | smoke tests for the async base |
 
-At last count: **127 tests** covering both the sync and async bases.
+At last count: **131 tests** covering both the sync and async bases.
 
 ---
 
