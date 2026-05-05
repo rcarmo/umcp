@@ -278,7 +278,7 @@ class AsyncMCPServer:
         return out
 
     async def handle_prompt_get_async(self, request_id: str | int | None, params: dict[str, Any]) -> dict[str, Any]:
-        """Async handler for prompts/get supporting sync or async prompt methods."""
+        """Async handler for ``prompts/get`` supporting sync or async methods."""
         prompt_name = params.get('name')
         if not prompt_name:
             error = self.create_error(-32602, "Missing required parameter 'name'")
@@ -287,44 +287,77 @@ class AsyncMCPServer:
         if not hasattr(self, method_name):
             error = self.create_error(-32601, f"Prompt not found: {prompt_name}")
             return self.create_response(request_id, None, error)
+
         method = getattr(self, method_name)
         sig = signature(method)
         doc = getdoc(method) or f"Prompt template {prompt_name}"
         arguments = params.get('arguments', {}) or {}
         categories = self._extract_prompt_categories(doc)
-        result_body: dict[str, Any] = { 'description': doc }
+        result_body: dict[str, Any] = {'description': doc}
         if categories:
             result_body['categories'] = categories
-        if arguments:
-            try:
-                kwargs = {}
-                for p_name, p in sig.parameters.items():
-                    if p_name == 'self':
-                        continue
-                    if p_name in arguments:
-                        kwargs[p_name] = arguments[p_name]
-                    elif p.default != Parameter.empty:
-                        kwargs[p_name] = p.default
-                    else:
-                        raise ValueError(f"Missing required argument '{p_name}' for prompt {prompt_name}")
-                if iscoroutinefunction(method):
-                    ret = await method(**kwargs)
+
+        allowed_params = {p_name for p_name in sig.parameters if p_name != 'self'}
+        unknown_params = sorted(key for key in arguments if key not in allowed_params)
+        if unknown_params:
+            error = self.create_error(
+                -32602, "Unrecognized parameter(s): " + ", ".join(unknown_params)
+            )
+            return self.create_response(request_id, None, error)
+
+        try:
+            type_hints = get_type_hints(method)
+        except (NameError, AttributeError, TypeError):
+            type_hints = {}
+
+        try:
+            kwargs = {}
+            for p_name, p in sig.parameters.items():
+                if p_name == 'self':
+                    continue
+                if p_name in arguments:
+                    value = arguments[p_name]
+                    if p_name in type_hints:
+                        value = self._coerce_value(value, type_hints[p_name])
+                    kwargs[p_name] = value
+                elif p.default != Parameter.empty:
+                    kwargs[p_name] = p.default
                 else:
-                    ret = await get_event_loop().run_in_executor(None, lambda: method(**kwargs))
-                messages: list[dict[str, Any]] | None = None
-                if isinstance(ret, str):
-                    messages = [{ 'role': 'user', 'content': { 'type': 'text', 'text': ret } }]
-                elif isinstance(ret, list) and all(isinstance(m, dict) and 'role' in m and 'content' in m for m in ret):
-                    messages = ret
-                elif isinstance(ret, dict) and 'messages' in ret and isinstance(ret['messages'], list):
-                    messages = ret['messages']
-                else:
-                    # Fallback: stringify arbitrary return structure
-                    messages = [{ 'role': 'user', 'content': { 'type': 'text', 'text': dumps(ret, ensure_ascii=False) } }]
-                result_body['messages'] = messages
-            except (ValueError, TypeError) as e:
-                error = self.create_error(-32603, f"Prompt execution error: {e}")
-                return self.create_response(request_id, None, error)
+                    raise ValueError(f"Missing required argument '{p_name}' for prompt {prompt_name}")
+        except ValueError as e:
+            error = self.create_error(-32602, str(e))
+            return self.create_response(request_id, None, error)
+
+        try:
+            if iscoroutinefunction(method):
+                ret = await method(**kwargs)
+            else:
+                ret = await get_event_loop().run_in_executor(None, lambda: method(**kwargs))
+        except Exception as e:  # noqa: BLE001
+            error = self.create_error(-32603, f"Prompt execution error: {e}")
+            return self.create_response(request_id, None, error)
+
+        if isinstance(ret, str):
+            result_body['messages'] = [{'role': 'user', 'content': {'type': 'text', 'text': ret}}]
+        elif isinstance(ret, list) and all(isinstance(m, dict) and 'role' in m and 'content' in m for m in ret):
+            result_body['messages'] = ret
+        elif isinstance(ret, dict):
+            if 'messages' in ret and isinstance(ret['messages'], list):
+                merged = dict(ret)
+                merged.setdefault('description', doc)
+                if categories and 'categories' not in merged:
+                    merged['categories'] = categories
+                result_body = merged
+            else:
+                result_body['messages'] = [{
+                    'role': 'user',
+                    'content': {'type': 'text', 'text': dumps(ret, ensure_ascii=False)}
+                }]
+        else:
+            result_body['messages'] = [{
+                'role': 'user',
+                'content': {'type': 'text', 'text': dumps(ret, ensure_ascii=False)}
+            }]
         return self.create_response(request_id, result_body, None)
 
     @staticmethod
@@ -921,7 +954,7 @@ class AsyncMCPServer:
         return self.create_response(request_id, tools_info)
 
     async def handle_tools_call_async(self, request_id: int, params: dict[str, Any]) -> dict[str, Any]:
-        """Handle tools/call request asynchronously."""
+        """Handle ``tools/call`` asynchronously."""
         import traceback
 
         tool_name = params.get("name")
@@ -933,98 +966,83 @@ class AsyncMCPServer:
             error = self.create_error(-32602, "Missing 'name' parameter")
             return self.create_response(request_id, None, error)
 
-        # Find the tool method
         method_name = f"tool_{tool_name}"
         method = getattr(self, method_name, None)
-
-        if method and callable(method):
-            try:
-                # Get method signature for parameter mapping
-                sig = signature(method)
-                self.logger.info("TOOL DISPATCH: %s signature: %s", tool_name, sig)
-
-                # Map from arguments dict to individual parameters
-                params_list = [p for name, p in sig.parameters.items() if name != 'self']
-
-                # Reject unknown parameters to keep tool contracts strict
-                # (applies even when the tool takes no parameters at all).
-                allowed_params = {
-                    param_name for param_name in sig.parameters
-                    if param_name != 'self'
-                }
-                unknown_params = sorted(
-                    key for key in arguments
-                    if key not in allowed_params
-                )
-                if unknown_params:
-                    raise ValueError(
-                        "Unrecognized parameter(s): " + ", ".join(unknown_params)
-                    )
-
-                if len(params_list) == 0:
-                    # No parameters - call method based on whether it's async
-                    self.logger.info("TOOL EXEC: %s (no params, async=%s)", tool_name, iscoroutinefunction(method))
-                    if iscoroutinefunction(method):
-                        content = await method()
-                    else:
-                        # Run sync method in thread pool to avoid blocking
-                        content = await get_event_loop().run_in_executor(None, method)
-                else:
-                    # Individual parameters - map from arguments dict
-                    # Get type hints for coercion
-                    try:
-                        type_hints = get_type_hints(method)
-                    except (NameError, AttributeError, TypeError):
-                        type_hints = {}
-
-                    kwargs = {}
-                    for param_name, param in sig.parameters.items():
-                        if param_name == 'self':
-                            continue
-
-                        if param_name in arguments:
-                            value = arguments[param_name]
-                            # Coerce value to expected type if we have type hints
-                            if param_name in type_hints:
-                                value = self._coerce_value(value, type_hints[param_name])
-                            kwargs[param_name] = value
-                        elif param.default != Parameter.empty:
-                            # Use default value if available
-                            kwargs[param_name] = param.default
-                        else:
-                            # Required parameter is missing
-                            raise ValueError(f"Required parameter '{param_name}' is missing")
-
-                    # Call method based on whether it's async
-                    self.logger.info("TOOL EXEC: %s with kwargs: %s (async=%s)", tool_name, list(kwargs.keys()), iscoroutinefunction(method))
-                    if iscoroutinefunction(method):
-                        content = await method(**kwargs)
-                    else:
-                        # Run sync method in thread pool to avoid blocking
-                        content = await get_event_loop().run_in_executor(
-                            None, lambda: method(**kwargs)
-                        )
-
-                self.logger.info("TOOL SUCCESS: %s returned type: %s", tool_name, type(content).__name__)
-
-                if content is None:
-                    error = self.create_error(-32603, f"Tool execution error for {tool_name}")
-                    return self.create_response(request_id, None, error)
-
-            except Exception as e:
-                # Catch ALL exceptions and log full stack trace
-                tb = traceback.format_exc()
-                self.logger.error("TOOL ERROR: %s failed with %s: %s\n%s", tool_name, type(e).__name__, e, tb)
-                error = self.create_error(-32603, f"Tool execution error for {tool_name}: {type(e).__name__}: {str(e)}")
-                return self.create_response(request_id, None, error)
-        else:
+        if not method or not callable(method):
             error = self.create_error(-32601, f"Tool not found: {tool_name}")
             return self.create_response(request_id, None, error)
 
-        # Ensure proper JSON encoding for the content
-        stringified_content = dumps(content) if isinstance(content, (dict, list)) else str(content)
+        sig = signature(method)
+        self.logger.info("TOOL DISPATCH: %s signature: %s", tool_name, sig)
 
-        # Build the response structure with the stringified content
+        params_list = [p for name, p in sig.parameters.items() if name != 'self']
+        allowed_params = {
+            param_name for param_name in sig.parameters
+            if param_name != 'self'
+        }
+        unknown_params = sorted(
+            key for key in arguments
+            if key not in allowed_params
+        )
+        if unknown_params:
+            error = self.create_error(
+                -32602, "Unrecognized parameter(s): " + ", ".join(unknown_params)
+            )
+            return self.create_response(request_id, None, error)
+
+        try:
+            type_hints = get_type_hints(method)
+        except (NameError, AttributeError, TypeError):
+            type_hints = {}
+
+        try:
+            if len(params_list) == 0:
+                self.logger.info("TOOL EXEC: %s (no params, async=%s)", tool_name, iscoroutinefunction(method))
+                if iscoroutinefunction(method):
+                    content = await method()
+                else:
+                    content = await get_event_loop().run_in_executor(None, method)
+            else:
+                kwargs = {}
+                for param_name, param in sig.parameters.items():
+                    if param_name == 'self':
+                        continue
+
+                    if param_name in arguments:
+                        value = arguments[param_name]
+                        if param_name in type_hints:
+                            value = self._coerce_value(value, type_hints[param_name])
+                        kwargs[param_name] = value
+                    elif param.default != Parameter.empty:
+                        kwargs[param_name] = param.default
+                    else:
+                        raise ValueError(f"Required parameter '{param_name}' is missing")
+
+                self.logger.info("TOOL EXEC: %s with kwargs: %s (async=%s)", tool_name, list(kwargs.keys()), iscoroutinefunction(method))
+                if iscoroutinefunction(method):
+                    content = await method(**kwargs)
+                else:
+                    content = await get_event_loop().run_in_executor(
+                        None, lambda: method(**kwargs)
+                    )
+        except ValueError as e:
+            return self.create_response(request_id, None, self.create_error(-32602, str(e)))
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.logger.error("TOOL ERROR: %s failed with %s: %s\n%s", tool_name, type(e).__name__, e, tb)
+            error = self.create_error(-32603, f"Tool execution error for {tool_name}: {type(e).__name__}: {str(e)}")
+            return self.create_response(request_id, None, error)
+
+        self.logger.info("TOOL SUCCESS: %s returned type: %s", tool_name, type(content).__name__)
+
+        if isinstance(content, str):
+            stringified_content = content
+        else:
+            try:
+                stringified_content = dumps(content, ensure_ascii=False)
+            except TypeError:
+                stringified_content = str(content)
+
         result = {
             "content": [{
                 "type": "text",
@@ -1070,11 +1088,22 @@ class AsyncMCPServer:
             error = self.create_error(-32700, "Parse error")
             return self.create_response(None, None, error)
 
+        if not isinstance(request, dict):
+            error = self.create_error(-32600, "Invalid Request: top-level JSON value must be an object")
+            return self.create_response(None, None, error)
+
         # Extract request components
         jsonrpc = request.get("jsonrpc")
         method = request.get("method")
         params = request.get("params", {})
         request_id = request.get("id")
+
+        if params is None:
+            params = {}
+        elif not isinstance(params, dict):
+            return self.create_response(
+                request_id, None, self.create_error(-32602, "Invalid params: expected an object")
+            )
 
         self.logger.info("Processing method: %s (id: %s)", method, request_id)
 

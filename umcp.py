@@ -273,7 +273,14 @@ class MCPServer:
         return out
 
     def handle_prompt_get(self, request_id: str | int | None, params: dict[str, Any]) -> dict[str, Any]:
-        """Handle prompts/get: return a prompt description and message list."""
+        """Handle ``prompts/get``.
+
+        Unlike the earlier implementation, prompts are executed even when the
+        caller omits the ``arguments`` field entirely (which matters for
+        zero-arg prompts), required arguments are validated consistently, and
+        unknown arguments are rejected with ``-32602`` rather than being
+        ignored silently.
+        """
         prompt_name = params.get('name')
         if not prompt_name:
             error = self.create_error(-32602, "Missing required parameter 'name'")
@@ -282,6 +289,7 @@ class MCPServer:
         if not hasattr(self, method_name):
             error = self.create_error(-32601, f"Prompt not found: {prompt_name}")
             return self.create_response(request_id, None, error)
+
         method = getattr(self, method_name)
         sig = signature(method)
         doc = getdoc(method) or f"Prompt template {prompt_name}"
@@ -290,39 +298,71 @@ class MCPServer:
         result_body: dict[str, Any] = {'description': doc}
         if categories:
             result_body['categories'] = categories
-        if arguments:
-            try:
-                kwargs = {}
-                for p_name, p in sig.parameters.items():
-                    if p_name == 'self':
-                        continue
-                    if p_name in arguments:
-                        kwargs[p_name] = arguments[p_name]
-                    elif p.default != Parameter.empty:
-                        kwargs[p_name] = p.default
-                    else:
-                        raise ValueError(
-                            f"Missing required argument '{p_name}' for prompt {prompt_name}"
-                        )
-                ret = method(**kwargs)
-                messages: list[dict[str, Any]] | None = None
-                if isinstance(ret, str):
-                    messages = [{'role': 'user', 'content': {'type': 'text', 'text': ret}}]
-                elif isinstance(ret, list) and all(
-                    isinstance(m, dict) and 'role' in m and 'content' in m for m in ret
-                ):
-                    messages = ret
-                elif isinstance(ret, dict) and 'messages' in ret and isinstance(ret['messages'], list):
-                    messages = ret['messages']
+
+        allowed_params = {p_name for p_name in sig.parameters if p_name != 'self'}
+        unknown_params = sorted(key for key in arguments if key not in allowed_params)
+        if unknown_params:
+            error = self.create_error(
+                -32602, "Unrecognized parameter(s): " + ", ".join(unknown_params)
+            )
+            return self.create_response(request_id, None, error)
+
+        try:
+            type_hints = get_type_hints(method)
+        except (NameError, AttributeError, TypeError):
+            type_hints = {}
+
+        try:
+            kwargs = {}
+            for p_name, p in sig.parameters.items():
+                if p_name == 'self':
+                    continue
+                if p_name in arguments:
+                    value = arguments[p_name]
+                    if p_name in type_hints:
+                        value = self._coerce_value(value, type_hints[p_name])
+                    kwargs[p_name] = value
+                elif p.default != Parameter.empty:
+                    kwargs[p_name] = p.default
                 else:
-                    messages = [{
-                        'role': 'user',
-                        'content': {'type': 'text', 'text': dumps(ret, ensure_ascii=False)}
-                    }]
-                result_body['messages'] = messages
-            except (ValueError, TypeError) as e:
-                error = self.create_error(-32603, f"Prompt execution error: {e}")
-                return self.create_response(request_id, None, error)
+                    raise ValueError(
+                        f"Missing required argument '{p_name}' for prompt {prompt_name}"
+                    )
+        except ValueError as e:
+            error = self.create_error(-32602, str(e))
+            return self.create_response(request_id, None, error)
+
+        try:
+            ret = method(**kwargs)
+        except Exception as e:  # noqa: BLE001
+            error = self.create_error(-32603, f"Prompt execution error: {e}")
+            return self.create_response(request_id, None, error)
+
+        if isinstance(ret, str):
+            result_body['messages'] = [
+                {'role': 'user', 'content': {'type': 'text', 'text': ret}}
+            ]
+        elif isinstance(ret, list) and all(
+            isinstance(m, dict) and 'role' in m and 'content' in m for m in ret
+        ):
+            result_body['messages'] = ret
+        elif isinstance(ret, dict):
+            if 'messages' in ret and isinstance(ret['messages'], list):
+                merged = dict(ret)
+                merged.setdefault('description', doc)
+                if categories and 'categories' not in merged:
+                    merged['categories'] = categories
+                result_body = merged
+            else:
+                result_body['messages'] = [{
+                    'role': 'user',
+                    'content': {'type': 'text', 'text': dumps(ret, ensure_ascii=False)}
+                }]
+        else:
+            result_body['messages'] = [{
+                'role': 'user',
+                'content': {'type': 'text', 'text': dumps(ret, ensure_ascii=False)}
+            }]
         return self.create_response(request_id, result_body, None)
 
     # ==== Resource discovery & handling ====
@@ -914,7 +954,7 @@ class MCPServer:
         return self.create_response(request_id, result, None)
 
     def handle_tools_call(self, request_id: str | int | None, params: dict[str, Any]) -> dict[str, Any]:
-        """Handle tool calls - delegates to tool implementations."""
+        """Handle ``tools/call`` - delegates to tool implementations."""
         tool_name = params.get('name', '')
         arguments = params.get('arguments', {})
 
@@ -930,37 +970,36 @@ class MCPServer:
             error = self.create_error(-32601, f"Tool not found: {tool_name}")
             return self.create_response(request_id, None, error)
 
-        try:
-            method = getattr(self, tool_method_name)
-            sig = signature(method)
-            self.logger.info("TOOL DISPATCH: %s signature: %s", tool_name, sig)
+        method = getattr(self, tool_method_name)
+        sig = signature(method)
+        self.logger.info("TOOL DISPATCH: %s signature: %s", tool_name, sig)
 
-            params_list = [p for name, p in sig.parameters.items() if name != 'self']
+        params_list = [p for name, p in sig.parameters.items() if name != 'self']
 
-            # Reject unknown parameters to keep tool contracts strict (applies
-            # even when the tool takes no parameters at all).
-            allowed_params = {
-                param_name for param_name in sig.parameters
-                if param_name != 'self'
-            }
-            unknown_params = sorted(
-                key for key in arguments
-                if key not in allowed_params
+        allowed_params = {
+            param_name for param_name in sig.parameters
+            if param_name != 'self'
+        }
+        unknown_params = sorted(
+            key for key in arguments
+            if key not in allowed_params
+        )
+        if unknown_params:
+            error = self.create_error(
+                -32602, "Unrecognized parameter(s): " + ", ".join(unknown_params)
             )
-            if unknown_params:
-                raise ValueError(
-                    "Unrecognized parameter(s): " + ", ".join(unknown_params)
-                )
+            return self.create_response(request_id, None, error)
 
+        try:
+            type_hints = get_type_hints(method)
+        except (NameError, AttributeError, TypeError):
+            type_hints = {}
+
+        try:
             if len(params_list) == 0:
                 self.logger.info("TOOL EXEC: %s (no params)", tool_name)
                 content = method()
             else:
-                try:
-                    type_hints = get_type_hints(method)
-                except (NameError, AttributeError, TypeError):
-                    type_hints = {}
-
                 kwargs = {}
                 for param_name, param in sig.parameters.items():
                     if param_name == 'self':
@@ -977,13 +1016,9 @@ class MCPServer:
 
                 self.logger.info("TOOL EXEC: %s with kwargs: %s", tool_name, list(kwargs.keys()))
                 content = method(**kwargs)
-
-            self.logger.info("TOOL SUCCESS: %s returned type: %s", tool_name, type(content).__name__)
-
-            if content is None:
-                error = self.create_error(-32603, f"Tool execution error for {tool_name}")
-                return self.create_response(request_id, None, error)
-
+        except ValueError as e:
+            error = self.create_error(-32602, str(e))
+            return self.create_response(request_id, None, error)
         except Exception as e:
             tb = traceback.format_exc()
             self.logger.error("TOOL ERROR: %s failed with %s: %s\n%s", tool_name, type(e).__name__, e, tb)
@@ -992,7 +1027,16 @@ class MCPServer:
             )
             return self.create_response(request_id, None, error)
 
-        stringified_content = dumps(content) if isinstance(content, (dict, list)) else str(content)
+        self.logger.info("TOOL SUCCESS: %s returned type: %s", tool_name, type(content).__name__)
+
+        if isinstance(content, str):
+            stringified_content = content
+        else:
+            try:
+                stringified_content = dumps(content, ensure_ascii=False)
+            except TypeError:
+                stringified_content = str(content)
+
         result = {
             "content": [{
                 "type": "text",
@@ -1029,10 +1073,20 @@ class MCPServer:
             error = self.create_error(-32700, "Parse error")
             return self.create_response(None, None, error)
 
+        if not isinstance(request, dict):
+            error = self.create_error(-32600, "Invalid Request: top-level JSON value must be an object")
+            return self.create_response(None, None, error)
+
         jsonrpc = request.get('jsonrpc')
         request_id = request.get('id')
         method = request.get('method')
         params = request.get('params', {})
+
+        if params is None:
+            params = {}
+        elif not isinstance(params, dict):
+            error = self.create_error(-32602, "Invalid params: expected an object")
+            return self.create_response(request_id, None, error)
 
         self.logger.info("Processing method: %s (id: %s)", method, request_id)
 

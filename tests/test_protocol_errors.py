@@ -53,6 +53,12 @@ def test_sync_invalid_json_returns_parse_error() -> None:
     assert resp["error"]["code"] == -32700  # JSON-RPC parse error
 
 
+def test_sync_non_object_top_level_json_is_invalid_request() -> None:
+    s = _SyncProtoServer()
+    resp = _send_sync(s, "[]")
+    assert resp["error"]["code"] == -32600
+
+
 def test_sync_wrong_jsonrpc_version_rejected() -> None:
     s = _SyncProtoServer()
     resp = _send_sync(s, {"jsonrpc": "1.0", "id": 1, "method": "tools/list"})
@@ -63,6 +69,14 @@ def test_sync_unknown_method_returns_minus_32601() -> None:
     s = _SyncProtoServer()
     resp = _send_sync(s, {"jsonrpc": "2.0", "id": 1, "method": "tools/wat"})
     assert resp["error"]["code"] == -32601
+
+
+def test_sync_non_object_params_returns_invalid_params() -> None:
+    s = _SyncProtoServer()
+    resp = _send_sync(s, {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": []
+    })
+    assert resp["error"]["code"] == -32602
 
 
 def test_sync_tools_call_missing_name() -> None:
@@ -86,12 +100,7 @@ def test_sync_tools_call_with_unknown_argument_is_rejected() -> None:
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": "echo", "arguments": {"message": "hi", "force": True}},
     })
-    # Either a structured -32602 or a content-flagged isError response is
-    # acceptable; both indicate the wire-level layer caught the bad arg.
-    if "error" in resp:
-        assert resp["error"]["code"] in (-32602, -32603, -32000)
-    else:
-        assert resp["result"].get("isError") is True
+    assert resp["error"]["code"] == -32602
 
 
 def test_sync_tool_that_raises_does_not_crash_server() -> None:
@@ -100,12 +109,7 @@ def test_sync_tool_that_raises_does_not_crash_server() -> None:
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": "explode", "arguments": {}},
     })
-    # Should be either a -32603 error or an isError content response, not a
-    # raised exception at the wire level.
-    if "error" in resp:
-        assert resp["error"]["code"] in (-32603, -32000)
-    else:
-        assert resp["result"].get("isError") is True
+    assert resp["error"]["code"] == -32603
 
 
 def test_sync_prompts_get_unknown_returns_error() -> None:
@@ -149,10 +153,24 @@ def test_async_invalid_json_returns_parse_error() -> None:
     assert resp["error"]["code"] == -32700
 
 
+def test_async_non_object_top_level_json_is_invalid_request() -> None:
+    s = _AsyncProtoServer()
+    resp = _send_async(s, "[]")
+    assert resp["error"]["code"] == -32600
+
+
 def test_async_unknown_method_returns_minus_32601() -> None:
     s = _AsyncProtoServer()
     resp = _send_async(s, {"jsonrpc": "2.0", "id": 1, "method": "tools/nope"})
     assert resp["error"]["code"] == -32601
+
+
+def test_async_non_object_params_returns_invalid_params() -> None:
+    s = _AsyncProtoServer()
+    resp = _send_async(s, {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": []
+    })
+    assert resp["error"]["code"] == -32602
 
 
 def test_async_tools_call_unknown_tool() -> None:
@@ -170,10 +188,7 @@ def test_async_tool_that_raises_does_not_crash_server() -> None:
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": "explode", "arguments": {}},
     })
-    if "error" in resp:
-        assert resp["error"]["code"] in (-32603, -32000)
-    else:
-        assert resp["result"].get("isError") is True
+    assert resp["error"]["code"] == -32603
 
 
 def test_async_notifications_initialized_returns_none() -> None:

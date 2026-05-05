@@ -78,7 +78,7 @@ def test_async_prompt_get_async_return():
     assert 'tester' in msgs[0]['content']['text']
 
 
-def test_async_prompts_description_only():
+def test_async_prompts_missing_required_argument_returns_invalid_params():
     server = AsyncPromptTestServer()
     req = json.dumps({
         "jsonrpc": "2.0",
@@ -87,7 +87,7 @@ def test_async_prompts_description_only():
         "params": {"name": "brainstorm"}
     })
     resp = asyncio.run(server.process_request_async(req))
-    assert 'messages' not in resp['result']  # no args => description only
+    assert resp['error']['code'] == -32602
 
 
 if __name__ == '__main__':  # Manual run helper
@@ -95,7 +95,7 @@ if __name__ == '__main__':  # Manual run helper
         test_async_prompts_list,
         test_async_prompt_get_sync_return,
         test_async_prompt_get_async_return,
-        test_async_prompts_description_only,
+        test_async_prompts_missing_required_argument_returns_invalid_params,
     ]
     out = []
     for t in tests:
