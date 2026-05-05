@@ -1,0 +1,54 @@
+[project]
+name = "umcp"
+version = "0.2.0"
+description = "Lightweight zero-dependency Model Context Protocol (MCP) server in pure Python."
+readme = "readme.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Rui Carmo", email = "rui.carmo@gmail.com" }]
+keywords = ["mcp", "model-context-protocol", "json-rpc", "llm", "ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/rcarmo/umcp"
+Documentation = "https://github.com/rcarmo/umcp/blob/main/readme.md"
+Issues = "https://github.com/rcarmo/umcp/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra --strict-markers"
+asyncio_mode = "strict"
+filterwarnings = [
+    "error::DeprecationWarning:umcp",
+    "error::DeprecationWarning:aioumcp",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["umcp", "aioumcp"]
+omit = ["tests/*", "examples/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "except KeyboardInterrupt",
+]
+show_missing = true
+skip_covered = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]

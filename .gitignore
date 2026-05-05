@@ -1,3 +1,13 @@
 *.log
 __pycache__/
 .aider*
+.coverage
+.coverage.*
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+*.egg-info/
+build/
+dist/
+.venv/
+uv.lock

@@ -395,26 +395,47 @@ and annotation inference, see
 
 ## 🧪 Testing
 
+The project uses `pytest` and ships a `Makefile` plus a GitHub Actions
+workflow that runs the suite on Python 3.10, 3.11, and 3.12.
+
 ```bash
-# All tests
+# Make targets (preferred)
+make test            # full suite
+make test-fast       # -x -q
+make coverage        # coverage report on stdout
+make coverage-html   # writes htmlcov/index.html
+make clean           # remove caches and log files
+
+# Or pytest directly
 python -m pytest tests/
 
-# Or with uv (recommended for a clean environment)
+# Or with uv (hermetic, no global pytest required)
 uv run --with pytest --with pytest-asyncio --python 3.12 \
   python -m pytest tests/
 
-# Specific files
-python -m pytest tests/test_introspection.py
-python -m pytest tests/test_prompts.py
-python -m pytest tests/test_async_prompts.py
-
-# Verbose
-python -m pytest tests/ -v
+# Specific files / verbose
+python -m pytest tests/test_resources.py -v
 ```
 
-The suite covers tool/prompt discovery, JSON-RPC protocol compliance,
-sync and async dispatch, schema fallback behaviour, and round-trips the
-example servers as subprocesses to catch transport bugs.
+### What the suite covers
+
+| File | Area |
+|---|---|
+| `test_introspection.py` | end-to-end tool discovery via subprocess |
+| `test_movieserver.py` | worked-example end-to-end test |
+| `test_protocol_errors.py` | JSON-RPC error paths -- parse/version/method/args/raise |
+| `test_schema_generation.py` | type hint -> JSON Schema mapping (primitives, `Optional`, `Union`, `Literal`, `TypedDict`, `list`/`dict`) |
+| `test_schema_fallbacks.py` | exotic-type schema fallback behaviour |
+| `test_annotations.py` | `readOnlyHint` / `destructiveHint` / `openWorldHint` inference + overrides |
+| `test_coercion.py` | stringy-client argument coercion (str -> int / float / bool) |
+| `test_prompts.py` / `test_async_prompts.py` | prompt discovery and dispatch |
+| `test_resources.py` | resources/list, /templates/list, /read, subscribe/unsubscribe, dynamic registration, capability declaration |
+| `test_notifications.py` | `notifications/resources/list_changed` and `notifications/resources/updated` emission and subscription gating |
+| `test_async_servers.py` | async stdio subprocess round-trips |
+| `test_transports.py` | sync stdio, sync TCP, sync SSE end-to-end |
+| `simple_async_test.py` | smoke tests for the async base |
+
+At last count: **78 tests** covering both the sync and async bases.
 
 ---
 
