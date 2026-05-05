@@ -41,6 +41,7 @@ _stdout_bin = _sys.stdout.buffer
 from asyncio import (
     CancelledError,
     Event,
+    Lock,
     StreamReader,
     StreamWriter,
     get_event_loop,
@@ -82,11 +83,13 @@ class AsyncMCPServer:
 
         # Resource state.
         self._resource_subscriptions: set[str] = set()
+        self._resource_session_subscriptions: dict[str, set[str]] = {}
         self._dynamic_resources: dict[str, tuple[dict[str, Any], Any]] = {}
         self._dynamic_resource_templates: list[tuple[dict[str, Any], Any]] = []
         # SSE session map -- populated by run_sse_async; declared here so
         # notification helpers can introspect it from any context.
-        self._sse_sessions: dict[str, tuple[StreamWriter, Event]] = {}
+        # session_id -> (writer, disconnect_event, write_lock)
+        self._sse_sessions: dict[str, tuple[StreamWriter, Event, Lock]] = {}
 
     def _setup_logging(self) -> None:
         """Set up logging configuration."""
@@ -885,7 +888,11 @@ class AsyncMCPServer:
                 request_id, None,
                 self.create_error(-32602, "Missing 'uri' parameter"),
             )
-        self._resource_subscriptions.add(uri)
+        session_id = params.get("_session_id")
+        if isinstance(session_id, str) and session_id:
+            self._resource_session_subscriptions.setdefault(session_id, set()).add(uri)
+        else:
+            self._resource_subscriptions.add(uri)
         return self.create_response(request_id, {})
 
     def handle_resources_unsubscribe(
@@ -897,16 +904,27 @@ class AsyncMCPServer:
                 request_id, None,
                 self.create_error(-32602, "Missing 'uri' parameter"),
             )
-        self._resource_subscriptions.discard(uri)
+        session_id = params.get("_session_id")
+        if isinstance(session_id, str) and session_id:
+            if session_id in self._resource_session_subscriptions:
+                self._resource_session_subscriptions[session_id].discard(uri)
+                if not self._resource_session_subscriptions[session_id]:
+                    self._resource_session_subscriptions.pop(session_id, None)
+        else:
+            self._resource_subscriptions.discard(uri)
         return self.create_response(request_id, {})
 
     async def _send_notification_async(
-        self, method: str, params: dict[str, Any] | None = None
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        session_ids: set[str] | None = None,
     ) -> None:
         """Emit a JSON-RPC notification on the active transport.
 
-        SSE: write to every connected session's StreamWriter.
-        Stdio / TCP / file mode: write one newline-delimited message to stdout.
+        SSE: write to every connected session's StreamWriter, or a targeted
+        subset for per-session resource subscriptions. Stdio / TCP / file mode:
+        write one newline-delimited message to stdout.
         """
         notification: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if params is not None:
@@ -915,10 +933,14 @@ class AsyncMCPServer:
 
         if self._sse_sessions:
             sse_blob = f"event: message\ndata: {payload_text}\n\n".encode()
-            for sid, (writer, _evt) in list(self._sse_sessions.items()):
+            target_items = list(self._sse_sessions.items())
+            if session_ids is not None:
+                target_items = [item for item in target_items if item[0] in session_ids]
+            for sid, (writer, _evt, write_lock) in target_items:
                 try:
-                    writer.write(sse_blob)
-                    await writer.drain()
+                    async with write_lock:
+                        writer.write(sse_blob)
+                        await writer.drain()
                 except Exception:  # noqa: BLE001
                     self.logger.debug("Dropping notification for stale SSE session %s", sid)
             return
@@ -935,7 +957,16 @@ class AsyncMCPServer:
 
     async def notify_resource_updated(self, uri: str) -> None:
         """Tell subscribed clients that *uri* has changed."""
-        if uri in self._resource_subscriptions:
+        target_sessions = {
+            session_id
+            for session_id, uris in self._resource_session_subscriptions.items()
+            if uri in uris
+        }
+        if target_sessions:
+            await self._send_notification_async(
+                "notifications/resources/updated", {"uri": uri}, session_ids=target_sessions,
+            )
+        elif uri in self._resource_subscriptions:
             await self._send_notification_async(
                 "notifications/resources/updated", {"uri": uri},
             )
@@ -1260,7 +1291,8 @@ class AsyncMCPServer:
 
             # Register session before writing headers so a fast POST finds it.
             disconnect_event = Event()
-            self._sse_sessions[session_id] = (writer, disconnect_event)
+            write_lock = Lock()
+            self._sse_sessions[session_id] = (writer, disconnect_event, write_lock)
 
             # Send HTTP response headers for the SSE stream.
             writer.write(
@@ -1283,12 +1315,14 @@ class AsyncMCPServer:
                     await sleep(15)
                     if writer.is_closing():
                         break
-                    writer.write(b": keepalive\n\n")
-                    await writer.drain()
+                    async with write_lock:
+                        writer.write(b": keepalive\n\n")
+                        await writer.drain()
             except (CancelledError, ConnectionError, OSError):
                 pass
             finally:
                 self._sse_sessions.pop(session_id, None)
+                self._resource_session_subscriptions.pop(session_id, None)
                 self.logger.info("SSE: session %s closed", session_id)
                 writer.close()
             return
@@ -1306,16 +1340,32 @@ class AsyncMCPServer:
                 writer.close()
                 return
 
-            sse_writer, _ = self._sse_sessions[session_id]
+            sse_writer, _disconnect_event, write_lock = self._sse_sessions[session_id]
             request_data = body.decode("utf-8", errors="replace")
             self.logger.info("SSE REQUEST (session %s): %s", session_id, request_data[:200])
+
+            try:
+                request_obj = loads(request_data)
+            except JSONDecodeError:
+                request_obj = None
+            if isinstance(request_obj, dict) and request_obj.get("method") in (
+                "resources/subscribe", "resources/unsubscribe"
+            ):
+                raw_params = request_obj.get("params")
+                if raw_params is None:
+                    raw_params = {}
+                if isinstance(raw_params, dict):
+                    request_obj["params"] = dict(raw_params)
+                    request_obj["params"]["_session_id"] = session_id
+                    request_data = dumps(request_obj)
 
             response = await self.process_request_async(request_data)
 
             if response is not None:
                 response_json = dumps(response)
-                sse_writer.write(f"event: message\ndata: {response_json}\n\n".encode())
-                await sse_writer.drain()
+                async with write_lock:
+                    sse_writer.write(f"event: message\ndata: {response_json}\n\n".encode())
+                    await sse_writer.drain()
 
             # Acknowledge the POST.
             writer.write(
@@ -1349,7 +1399,7 @@ class AsyncMCPServer:
         # notification helpers can introspect it from any context, but we
         # reset it here to ensure each ``run_sse_async`` invocation starts
         # from a clean session map.
-        self._sse_sessions: dict[str, tuple[StreamWriter, Event]] = {}
+        self._sse_sessions: dict[str, tuple[StreamWriter, Event, Lock]] = {}
 
         server = await start_server(self._sse_handle_client, host, port)
         addrs = [s.getsockname() for s in server.sockets]

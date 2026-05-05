@@ -82,8 +82,12 @@ class MCPServer:
         self._sse_sessions: dict[str, Queue] = {}
         self._sse_lock = threading.Lock()
 
-        # Resource subscriptions: set of URIs the client has subscribed to.
+        # Resource subscriptions. For stdio / TCP / file mode we keep a
+        # transport-global set of URIs. For SSE we also track per-session
+        # subscriptions so notifications can be targeted to the subscribing
+        # session instead of being broadcast to every connected client.
         self._resource_subscriptions: set[str] = set()
+        self._resource_session_subscriptions: dict[str, set[str]] = {}
         # Dynamically registered resources / templates (in addition to those
         # discovered via the ``resource_*`` / ``resource_template_*`` naming
         # conventions).  Each entry is ``(metadata, callable)``.
@@ -672,7 +676,11 @@ class MCPServer:
         if not uri:
             error = self.create_error(-32602, "Missing 'uri' parameter")
             return self.create_response(request_id, None, error)
-        self._resource_subscriptions.add(uri)
+        session_id = params.get("_session_id")
+        if isinstance(session_id, str) and session_id:
+            self._resource_session_subscriptions.setdefault(session_id, set()).add(uri)
+        else:
+            self._resource_subscriptions.add(uri)
         return self.create_response(request_id, {}, None)
 
     def handle_resources_unsubscribe(
@@ -683,32 +691,46 @@ class MCPServer:
         if not uri:
             error = self.create_error(-32602, "Missing 'uri' parameter")
             return self.create_response(request_id, None, error)
-        self._resource_subscriptions.discard(uri)
+        session_id = params.get("_session_id")
+        if isinstance(session_id, str) and session_id:
+            if session_id in self._resource_session_subscriptions:
+                self._resource_session_subscriptions[session_id].discard(uri)
+                if not self._resource_session_subscriptions[session_id]:
+                    self._resource_session_subscriptions.pop(session_id, None)
+        else:
+            self._resource_subscriptions.discard(uri)
         return self.create_response(request_id, {}, None)
 
-    def _send_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
+    def _send_notification(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        session_ids: set[str] | None = None,
+    ) -> None:
         """Emit a JSON-RPC notification on the active transport.
 
-        For SSE, broadcasts to every connected session.  For stdio / TCP /
-        file mode, writes one newline-delimited message to stdout.
+        For SSE, broadcasts to all connected sessions or a targeted subset.
+        For stdio / TCP / file mode, writes one newline-delimited message to
+        stdout.
         """
         notification: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             notification["params"] = params
         payload_text = dumps(notification)
 
-        # Broadcast to any SSE sessions if the transport is active.
         if self._sse_sessions:
             sse_blob = f"event: message\ndata: {payload_text}\n\n".encode()
             with self._sse_lock:
-                for q in list(self._sse_sessions.values()):
+                target_items = list(self._sse_sessions.items())
+                if session_ids is not None:
+                    target_items = [item for item in target_items if item[0] in session_ids]
+                for _sid, q in target_items:
                     try:
                         q.put(sse_blob)
                     except Exception:  # noqa: BLE001
                         pass
             return
 
-        # Otherwise fall back to stdout (stdio / file mode).
         try:
             _stdout_bin.write((payload_text + "\n").encode("utf-8"))
             _stdout_bin.flush()
@@ -722,10 +744,20 @@ class MCPServer:
     def notify_resource_updated(self, uri: str) -> None:
         """Tell subscribed clients that *uri* has changed.
 
-        The notification is only emitted when the URI has at least one
-        active subscription, matching the spec's intent.
+        Stdio / TCP / file mode uses the transport-global subscription set.
+        SSE uses per-session subscriptions so only the subscribing client gets
+        the update.
         """
-        if uri in self._resource_subscriptions:
+        target_sessions = {
+            session_id
+            for session_id, uris in self._resource_session_subscriptions.items()
+            if uri in uris
+        }
+        if target_sessions:
+            self._send_notification(
+                "notifications/resources/updated", {"uri": uri}, session_ids=target_sessions
+            )
+        elif uri in self._resource_subscriptions:
             self._send_notification(
                 "notifications/resources/updated", {"uri": uri}
             )
@@ -1245,6 +1277,7 @@ class MCPServer:
                 finally:
                     with server_self._sse_lock:
                         server_self._sse_sessions.pop(session_id, None)
+                    server_self._resource_session_subscriptions.pop(session_id, None)
                     server_self.logger.info("SSE: session %s closed", session_id)
 
             def do_POST(self) -> None:  # noqa: N802
@@ -1271,6 +1304,21 @@ class MCPServer:
                 body = self.rfile.read(length) if length > 0 else b""
                 request_data = body.decode("utf-8", errors="replace")
                 server_self.logger.info("SSE REQUEST (session %s): %s", session_id, request_data[:200])
+
+                try:
+                    request_obj = loads(request_data)
+                except JSONDecodeError:
+                    request_obj = None
+                if isinstance(request_obj, dict) and request_obj.get("method") in (
+                    "resources/subscribe", "resources/unsubscribe"
+                ):
+                    raw_params = request_obj.get("params")
+                    if raw_params is None:
+                        raw_params = {}
+                    if isinstance(raw_params, dict):
+                        request_obj["params"] = dict(raw_params)
+                        request_obj["params"]["_session_id"] = session_id
+                        request_data = dumps(request_obj)
 
                 response = server_self.process_request(request_data)
                 if response is not None:
