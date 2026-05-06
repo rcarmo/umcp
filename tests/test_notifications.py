@@ -169,14 +169,21 @@ def test_async_updated_gated_by_subscription(captured_stdout) -> None:
 class _FakeAsyncWriter:
     """Minimal StreamWriter stand-in for notification tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, fail_on_drain: bool = False) -> None:
         self.payloads: list[bytes] = []
+        self.fail_on_drain = fail_on_drain
+        self.closed = False
 
     def write(self, data: bytes) -> None:
         self.payloads.append(data)
 
     async def drain(self) -> None:
+        if self.fail_on_drain:
+            raise OSError("simulated broken pipe")
         return None
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_async_sse_updated_targets_only_subscribed_session() -> None:
@@ -214,3 +221,28 @@ def test_async_sse_list_changed_broadcasts_to_all_sessions() -> None:
     assert len(w2.payloads) == 1
     assert b'notifications/resources/list_changed' in w1.payloads[0]
     assert b'notifications/resources/list_changed' in w2.payloads[0]
+
+
+def test_async_stale_sse_session_is_evicted_on_notification_failure() -> None:
+    s = _AsyncNotifyServer()
+    bad = _FakeAsyncWriter(fail_on_drain=True)
+    good = _FakeAsyncWriter()
+    bad_event = asyncio.Event()
+    good_event = asyncio.Event()
+    s._sse_sessions = {
+        "bad": (bad, bad_event, asyncio.Lock()),
+        "good": (good, good_event, asyncio.Lock()),
+    }
+    s._resource_session_subscriptions = {
+        "bad": {"umcp://x/a"},
+        "good": {"umcp://x/a"},
+    }
+
+    asyncio.run(s.notify_resource_updated("umcp://x/a"))
+
+    assert "bad" not in s._sse_sessions
+    assert "bad" not in s._resource_session_subscriptions
+    assert bad_event.is_set()
+    assert bad.closed is True
+    assert len(good.payloads) == 1
+    assert b'notifications/resources/updated' in good.payloads[0]

@@ -936,13 +936,25 @@ class AsyncMCPServer:
             target_items = list(self._sse_sessions.items())
             if session_ids is not None:
                 target_items = [item for item in target_items if item[0] in session_ids]
+            stale_session_ids: list[str] = []
             for sid, (writer, _evt, write_lock) in target_items:
                 try:
                     async with write_lock:
                         writer.write(sse_blob)
                         await writer.drain()
                 except Exception:  # noqa: BLE001
+                    stale_session_ids.append(sid)
                     self.logger.debug("Dropping notification for stale SSE session %s", sid)
+            for sid in stale_session_ids:
+                session = self._sse_sessions.pop(sid, None)
+                self._resource_session_subscriptions.pop(sid, None)
+                if session is not None:
+                    writer, disconnect_event, _write_lock = session
+                    disconnect_event.set()
+                    try:
+                        writer.close()
+                    except Exception:  # noqa: BLE001
+                        pass
             return
 
         try:
@@ -1363,9 +1375,21 @@ class AsyncMCPServer:
 
             if response is not None:
                 response_json = dumps(response)
-                async with write_lock:
-                    sse_writer.write(f"event: message\ndata: {response_json}\n\n".encode())
-                    await sse_writer.drain()
+                try:
+                    async with write_lock:
+                        sse_writer.write(f"event: message\ndata: {response_json}\n\n".encode())
+                        await sse_writer.drain()
+                except Exception:  # noqa: BLE001
+                    self.logger.warning("SSE: failed to deliver response to session %s", session_id)
+                    session = self._sse_sessions.pop(session_id, None)
+                    self._resource_session_subscriptions.pop(session_id, None)
+                    if session is not None:
+                        _writer, disconnect_event, _lock = session
+                        disconnect_event.set()
+                    writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                    await writer.drain()
+                    writer.close()
+                    return
 
             # Acknowledge the POST.
             writer.write(
