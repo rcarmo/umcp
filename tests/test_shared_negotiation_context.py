@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import MappingProxyType
+
+import pytest
 
 from aioumcp import AsyncMCPServer
 from umcp import MCPServer
 from umcp_shared import (
+    MCPPrincipal,
     MCPRequestContext,
     SUPPORTED_PROTOCOL_VERSIONS,
     exact_or_fallback,
@@ -64,3 +68,24 @@ def test_async_initialize_negotiation_matches_sync():
         "params": {"protocolVersion": "2024-11-05"},
     })))
     assert response["result"]["protocolVersion"] == "2024-11-05"
+
+
+def test_request_context_headers_are_defensively_immutable():
+    headers = {"x-test": "one"}
+    ctx = MCPRequestContext(headers=headers)
+    headers["x-test"] = "two"
+    assert isinstance(ctx.headers, MappingProxyType)
+    assert ctx.headers["x-test"] == "one"
+    with pytest.raises(TypeError):
+        ctx.headers["x-test"] = "nope"  # type: ignore[index]
+
+
+def test_principal_metadata_is_defensively_immutable():
+    metadata = {"scope": "read"}
+    principal = MCPPrincipal(name="alice", roles=["admin"], metadata=metadata)
+    metadata["scope"] = "write"
+    assert principal.roles == ("admin",)
+    assert isinstance(principal.metadata, MappingProxyType)
+    assert principal.metadata["scope"] == "read"
+    with pytest.raises(TypeError):
+        principal.metadata["scope"] = "nope"  # type: ignore[index]

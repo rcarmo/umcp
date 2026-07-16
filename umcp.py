@@ -74,7 +74,7 @@ from umcp_shared import (
 from queue import Empty, Queue
 from sys import argv, exit
 from types import UnionType
-from typing import Any, Literal, Union, get_args, get_origin, get_type_hints, is_typeddict
+from typing import Any, Literal, Mapping, Union, get_args, get_origin, get_type_hints, is_typeddict
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
@@ -352,7 +352,7 @@ class MCPServer:
         try:
             ret = method(**kwargs)
         except Exception as e:  # noqa: BLE001
-            message = "Prompt execution failed" if get_request_context().transport == "streamable-http" else f"Prompt execution error: {e}"
+            message = self._remote_safe_failure("Prompt execution failed", f"Prompt execution error: {e}")
             error = self.create_error(-32603, message)
             return self.create_response(request_id, None, error)
 
@@ -632,7 +632,10 @@ class MCPServer:
                     value = method()
                 except Exception as exc:  # noqa: BLE001 -- wire-level handler
                     self.logger.exception("Resource %s raised", uri)
-                    error = self.create_error(-32603, f"Resource read failed: {exc}")
+                    error = self.create_error(
+                        -32603,
+                        self._remote_safe_failure("Resource read failed", f"Resource read failed: {exc}"),
+                    )
                     return self.create_response(request_id, None, error)
                 contents = self._normalise_resource_content(uri, meta.get("mimeType"), value)
                 return self.create_response(request_id, {"contents": contents}, None)
@@ -644,7 +647,10 @@ class MCPServer:
                 value = fn()
             except Exception as exc:  # noqa: BLE001
                 self.logger.exception("Resource %s raised", uri)
-                error = self.create_error(-32603, f"Resource read failed: {exc}")
+                error = self.create_error(
+                    -32603,
+                    self._remote_safe_failure("Resource read failed", f"Resource read failed: {exc}"),
+                )
                 return self.create_response(request_id, None, error)
             contents = self._normalise_resource_content(uri, meta.get("mimeType"), value)
             return self.create_response(request_id, {"contents": contents}, None)
@@ -659,7 +665,10 @@ class MCPServer:
                     value = method(**m.groupdict())
                 except Exception as exc:  # noqa: BLE001
                     self.logger.exception("Resource template %s raised", uri)
-                    error = self.create_error(-32603, f"Resource read failed: {exc}")
+                    error = self.create_error(
+                        -32603,
+                        self._remote_safe_failure("Resource read failed", f"Resource read failed: {exc}"),
+                    )
                     return self.create_response(request_id, None, error)
                 contents = self._normalise_resource_content(uri, meta.get("mimeType"), value)
                 return self.create_response(request_id, {"contents": contents}, None)
@@ -673,7 +682,10 @@ class MCPServer:
                     value = fn(**m.groupdict())
                 except Exception as exc:  # noqa: BLE001
                     self.logger.exception("Resource template %s raised", uri)
-                    error = self.create_error(-32603, f"Resource read failed: {exc}")
+                    error = self.create_error(
+                        -32603,
+                        self._remote_safe_failure("Resource read failed", f"Resource read failed: {exc}"),
+                    )
                     return self.create_response(request_id, None, error)
                 contents = self._normalise_resource_content(uri, meta.get("mimeType"), value)
                 return self.create_response(request_id, {"contents": contents}, None)
@@ -1071,7 +1083,10 @@ class MCPServer:
         except Exception as e:
             tb = traceback.format_exc()
             self.logger.error("TOOL ERROR: %s failed with %s: %s\n%s", tool_name, type(e).__name__, e, tb)
-            message = "Tool execution failed" if get_request_context().transport == "streamable-http" else f"Tool execution error for {tool_name}: {type(e).__name__}: {str(e)}"
+            message = self._remote_safe_failure(
+                "Tool execution failed",
+                f"Tool execution error for {tool_name}: {type(e).__name__}: {str(e)}",
+            )
             error = self.create_error(-32603, message)
             return self.create_response(request_id, None, error)
 
@@ -1112,18 +1127,25 @@ class MCPServer:
             error["data"] = data
         return error
 
-    def authenticate_request(self, *, method: str, path: str, headers: dict[str, str], peer: str | None) -> MCPPrincipal | None:
+    @staticmethod
+    def _remote_safe_failure(public_message: str, detailed_message: str) -> str:
+        transport = get_request_context().transport
+        if transport in {"streamable-http", "sse", "tcp"}:
+            return public_message
+        return detailed_message
+
+    def authenticate_request(self, *, method: str, path: str, headers: Mapping[str, str], peer: str | None) -> MCPPrincipal | None:
         return MCPPrincipal(name="anonymous")
 
-    def authorize_request(self, principal: MCPPrincipal | None, *, rpc_method: str, tool_name: str | None) -> bool:
+    def authorize_request(self, principal: MCPPrincipal | None, *, rpc_method: str | None, tool_name: str | None) -> bool:
         return True
 
     # Back-compat aliases.
-    def authenticate(self, headers: dict[str, str], peer: Any) -> MCPPrincipal | None:
+    def authenticate(self, headers: Mapping[str, str], peer: Any) -> MCPPrincipal | None:
         return self.authenticate_request(method="", path="", headers=headers, peer=str(peer) if peer is not None else None)
 
-    def authorize(self, principal: MCPPrincipal | None, method: str, params: dict[str, Any]) -> bool:
-        return self.authorize_request(principal, rpc_method=method, tool_name=(params.get("name") if isinstance(params, dict) else None))
+    def authorize(self, principal: MCPPrincipal | None, method: str | None, params: Mapping[str, Any]) -> bool:
+        return self.authorize_request(principal, rpc_method=method, tool_name=(params.get("name") if isinstance(params, Mapping) else None))
 
     def _with_request_context(self, *, transport: str | None, request_id: str | int | None, principal: str | None, peer: str | None, headers: dict[str, str], version: str | None, session_id: str | None = None):
         return set_request_context(MCPRequestContext(transport=transport, request_id=request_id, protocol_version=version, session_id=session_id, principal=principal, peer=peer, headers=headers))
@@ -1221,6 +1243,7 @@ class MCPServer:
                 peer = self.client_address
                 server_self.logger.info("Socket client connected: %s", peer)
                 try:
+                    self.connection.settimeout(30.0)
                     while True:
                         line = self.rfile.readline()
                         if not line:
@@ -1229,7 +1252,11 @@ class MCPServer:
                         if not decoded:
                             continue
                         server_self.logger.info("SOCKET REQUEST (%s): %s", peer, decoded)
-                        response = server_self.process_request(decoded)
+                        peer_name = f"{peer[0]}:{peer[1]}" if isinstance(peer, tuple) and len(peer) >= 2 else str(peer)
+                        response = server_self.process_request(
+                            decoded,
+                            context=MCPRequestContext(transport="tcp", peer=peer_name),
+                        )
                         if response is not None:
                             payload = (dumps(response) + "\n").encode("utf-8")
                             self.wfile.write(payload)
@@ -1266,6 +1293,10 @@ class MCPServer:
         allowed_origins = allowed_origins or []
 
         class _Handler(BaseHTTPRequestHandler):
+            def setup(self) -> None:
+                super().setup()
+                self.connection.settimeout(30.0)
+
             def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
                 server_self.logger.debug("HTTP %s - " + format, self.address_string(), *args)
 
@@ -1291,28 +1322,36 @@ class MCPServer:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers(); self.wfile.write(body)
 
-            def _rpc_ctx(self, request_id: str | int | None, version: str | None, principal: MCPPrincipal | None):
-                return server_self._with_request_context(transport="streamable-http", request_id=request_id, principal=(principal.name if principal else None), peer=self.client_address[0] if self.client_address else None, headers={k.lower(): v for k, v in self.headers.items()}, version=version)
-
-            def do_OPTIONS(self) -> None:  # noqa: N802
-                origin = self._allowed_origin()
-                if self.headers.get("Origin") and not origin:
-                    self.send_error(403 if host not in ("127.0.0.1", "localhost", "::1") else 405)
-                    return
-                self.send_response(204)
-                if origin:
-                    self.send_header("Access-Control-Allow-Origin", origin)
+            def _send_method_not_allowed(self, allow: str = "POST, OPTIONS") -> None:
+                self.send_response(405)
+                self.send_header("Allow", allow)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
 
-            def do_GET(self) -> None: self.send_error(405)
-            def do_DELETE(self) -> None: self.send_error(405)
+            def do_OPTIONS(self) -> None:  # noqa: N802
+                origin_header = self.headers.get("Origin")
+                if not origin_header:
+                    self._send_method_not_allowed()
+                    return
+                origin = self._allowed_origin()
+                if not origin:
+                    self.send_error(403)
+                    return
+                self.send_response(204)
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+                self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, MCP-Protocol-Version, Authorization")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self) -> None: self._send_method_not_allowed()
+            def do_DELETE(self) -> None: self._send_method_not_allowed()
 
             def do_POST(self) -> None:  # noqa: N802
+                self.connection.settimeout(30.0)
                 if self.path != endpoint:
-                    self.send_response(405)
-                    self.send_header("Allow", "POST, OPTIONS")
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
+                    self._send_method_not_allowed()
                     return
                 if not content_type_is_json(self.headers.get("Content-Type")):
                     self.send_error(415); return
@@ -1327,7 +1366,14 @@ class MCPServer:
                     self.send_error(400); return
                 if n > max_request_bytes:
                     self.send_error(413); return
-                body = self.rfile.read(n)
+                try:
+                    body = self.rfile.read(n)
+                except TimeoutError:
+                    self.send_error(400)
+                    return
+                if len(body) != n:
+                    self.send_error(400)
+                    return
                 origin = self._allowed_origin()
                 if self.headers.get("Origin") and not origin:
                     self.send_error(403); return
@@ -1503,7 +1549,15 @@ class MCPServer:
                         request_obj["params"]["_session_id"] = session_id
                         request_data = dumps(request_obj)
 
-                response = server_self.process_request(request_data)
+                response = server_self.process_request(
+                    request_data,
+                    context=MCPRequestContext(
+                        transport="sse",
+                        request_id=request_obj.get("id") if isinstance(request_obj, dict) else None,
+                        session_id=session_id,
+                        peer=self.client_address[0] if self.client_address else None,
+                    ),
+                )
                 if response is not None:
                     response_json = dumps(response)
                     queue.put(f"event: message\ndata: {response_json}\n\n".encode())
@@ -1589,7 +1643,7 @@ class MCPServer:
                 with open(args[0], encoding='utf-8') as f:
                     input_data = f.read()
                 self.logger.info("REQUEST: %s", input_data)
-                response = self.process_request(input_data)
+                response = self.process_request(input_data, context=MCPRequestContext(transport="file"))
                 if response is not None:
                     payload = (dumps(response) + "\n").encode("utf-8")
                     _stdout_bin.write(payload)
@@ -1609,7 +1663,7 @@ class MCPServer:
                     if not line:
                         continue
                     self.logger.info("REQUEST: %s", line)
-                    response = self.process_request(line)
+                    response = self.process_request(line, context=MCPRequestContext(transport="stdio"))
                     if response is not None:
                         payload = (dumps(response) + "\n").encode("utf-8")
                         _stdout_bin.write(payload)

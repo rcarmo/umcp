@@ -544,6 +544,51 @@ for the rationale.
 
 ---
 
+## 🚢 Deployment notes
+
+For local hosts (Claude Desktop, VS Code, Copilot, Piclaw, etc.), prefer
+**stdio**. `umcp` now tags stdio/file requests as local request contexts,
+keeps request metadata immutable, and avoids exposing internal exception
+strings over remote transports.
+
+If you need network access, prefer **streamable HTTP** over legacy SSE/TCP:
+
+* bind to loopback unless you have a real reason not to;
+* implement `authenticate_request()` and `authorize_request()` for remote use;
+* require a supported `MCP-Protocol-Version` on non-`initialize` requests;
+* set `--allowed-origin` explicitly for browser clients, or rely on loopback-only
+  Origin handling for local web UIs;
+* expect `OPTIONS` preflight only when the browser sends a valid `Origin`.
+
+A typical reverse-proxy setup should preserve `Authorization`, `Origin`,
+`Accept`, `Content-Type`, and `MCP-Protocol-Version` headers unchanged.
+If the proxy terminates TLS or auth, keep the upstream `umcp` listener on
+localhost.
+
+Minimal `systemd` service sketch:
+
+```ini
+[Unit]
+Description=umcp HTTP server
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python /srv/umcp/server.py --port 9000 --http --host 127.0.0.1 --allowed-origin https://ui.example
+WorkingDirectory=/srv/umcp
+Restart=on-failure
+User=umcp
+Group=umcp
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Container deployments should follow the same pattern: keep the container
+port private, expose it through a reverse proxy, and do not publish raw
+SSE/TCP unless you have a separate auth story.
+
+---
+
 ## ❓ Troubleshooting
 
 **Server doesn't respond to JSON-RPC requests.** Check the JSON is

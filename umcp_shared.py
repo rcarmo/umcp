@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
@@ -12,6 +13,10 @@ class MCPPrincipal:
     name: str
     roles: tuple[str, ...] = ()
     metadata: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "roles", tuple(self.roles))
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +29,9 @@ class MCPRequestContext:
     peer: str | None = None
     headers: Mapping[str, str] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "headers", MappingProxyType(dict(self.headers)))
+
 
 _request_context: ContextVar[MCPRequestContext] = ContextVar(
     "umcp_request_context",
@@ -31,7 +39,7 @@ _request_context: ContextVar[MCPRequestContext] = ContextVar(
 )
 
 
-def set_request_context(ctx: MCPRequestContext | None):
+def set_request_context(ctx: MCPRequestContext):
     return _request_context.set(ctx)
 
 

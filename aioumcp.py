@@ -68,7 +68,7 @@ from logging import INFO, FileHandler, basicConfig, getLogger
 from pathlib import Path
 from sys import argv, exit
 from types import UnionType
-from typing import Any, Literal, Union, get_args, get_origin, get_type_hints, is_typeddict
+from typing import Any, Literal, Mapping, Union, get_args, get_origin, get_type_hints, is_typeddict
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
@@ -355,7 +355,7 @@ class AsyncMCPServer:
                 ctx = copy_context()
                 ret = await get_event_loop().run_in_executor(None, lambda: ctx.run(method, **kwargs))
         except Exception as e:  # noqa: BLE001
-            message = "Prompt execution failed" if get_request_context().transport == "streamable-http" else f"Prompt execution error: {e}"
+            message = self._remote_safe_failure("Prompt execution failed", f"Prompt execution error: {e}")
             error = self.create_error(-32603, message)
             return self.create_response(request_id, None, error)
 
@@ -844,7 +844,10 @@ class AsyncMCPServer:
                     self.logger.exception("Resource %s raised", uri)
                     return self.create_response(
                         request_id, None,
-                        self.create_error(-32603, f"Resource read failed: {exc}"),
+                        self.create_error(
+                            -32603,
+                            self._remote_safe_failure("Resource read failed", f"Resource read failed: {exc}"),
+                        ),
                     )
                 contents = self._normalise_resource_content(uri, meta.get("mimeType"), value)
                 return self.create_response(request_id, {"contents": contents})
@@ -857,7 +860,10 @@ class AsyncMCPServer:
                 self.logger.exception("Resource %s raised", uri)
                 return self.create_response(
                     request_id, None,
-                    self.create_error(-32603, f"Resource read failed: {exc}"),
+                    self.create_error(
+                        -32603,
+                        self._remote_safe_failure("Resource read failed", f"Resource read failed: {exc}"),
+                    ),
                 )
             contents = self._normalise_resource_content(uri, meta.get("mimeType"), value)
             return self.create_response(request_id, {"contents": contents})
@@ -873,7 +879,10 @@ class AsyncMCPServer:
                     self.logger.exception("Resource template %s raised", uri)
                     return self.create_response(
                         request_id, None,
-                        self.create_error(-32603, f"Resource read failed: {exc}"),
+                        self.create_error(
+                            -32603,
+                            self._remote_safe_failure("Resource read failed", f"Resource read failed: {exc}"),
+                        ),
                     )
                 contents = self._normalise_resource_content(uri, meta.get("mimeType"), value)
                 return self.create_response(request_id, {"contents": contents})
@@ -888,7 +897,10 @@ class AsyncMCPServer:
                     self.logger.exception("Resource template %s raised", uri)
                     return self.create_response(
                         request_id, None,
-                        self.create_error(-32603, f"Resource read failed: {exc}"),
+                        self.create_error(
+                            -32603,
+                            self._remote_safe_failure("Resource read failed", f"Resource read failed: {exc}"),
+                        ),
                     )
                 contents = self._normalise_resource_content(uri, meta.get("mimeType"), value)
                 return self.create_response(request_id, {"contents": contents})
@@ -1084,7 +1096,10 @@ class AsyncMCPServer:
         except Exception as e:
             tb = traceback.format_exc()
             self.logger.error("TOOL ERROR: %s failed with %s: %s\n%s", tool_name, type(e).__name__, e, tb)
-            message = "Tool execution failed" if get_request_context().transport == "streamable-http" else f"Tool execution error for {tool_name}: {type(e).__name__}: {str(e)}"
+            message = self._remote_safe_failure(
+                "Tool execution failed",
+                f"Tool execution error for {tool_name}: {type(e).__name__}: {str(e)}",
+            )
             error = self.create_error(-32603, message)
             return self.create_response(request_id, None, error)
 
@@ -1134,10 +1149,17 @@ class AsyncMCPServer:
             error["data"] = data
         return error
 
-    def authenticate_request(self, *, method: str, path: str, headers: dict[str, str], peer: str | None) -> MCPPrincipal | None:
+    @staticmethod
+    def _remote_safe_failure(public_message: str, detailed_message: str) -> str:
+        transport = get_request_context().transport
+        if transport in {"streamable-http", "sse", "tcp"}:
+            return public_message
+        return detailed_message
+
+    def authenticate_request(self, *, method: str, path: str, headers: Mapping[str, str], peer: str | None) -> MCPPrincipal | None:
         return MCPPrincipal(name="anonymous")
 
-    def authorize_request(self, principal: MCPPrincipal | None, *, rpc_method: str, tool_name: str | None) -> bool:
+    def authorize_request(self, principal: MCPPrincipal | None, *, rpc_method: str | None, tool_name: str | None) -> bool:
         return True
 
     def _with_request_context(self, *, transport: str | None, request_id: str | int | None, principal: str | None, peer: str | None, headers: dict[str, str], version: str | None, session_id: str | None = None):
@@ -1240,7 +1262,11 @@ class AsyncMCPServer:
                     continue
 
                 self.logger.info("SOCKET REQUEST (%s): %s", peer, line)
-                response = await self.process_request_async(line)
+                peer_name = f"{peer[0]}:{peer[1]}" if isinstance(peer, tuple) and len(peer) >= 2 else str(peer)
+                response = await self.process_request_async(
+                    line,
+                    context=MCPRequestContext(transport="tcp", peer=peer_name),
+                )
 
                 if response is not None:
                     payload = dumps(response) + "\n"
@@ -1410,7 +1436,15 @@ class AsyncMCPServer:
                     request_obj["params"]["_session_id"] = session_id
                     request_data = dumps(request_obj)
 
-            response = await self.process_request_async(request_data)
+            response = await self.process_request_async(
+                request_data,
+                context=MCPRequestContext(
+                    transport="sse",
+                    request_id=request_obj.get("id") if isinstance(request_obj, dict) else None,
+                    session_id=session_id,
+                    peer=peer[0] if peer else None,
+                ),
+            )
 
             if response is not None:
                 response_json = dumps(response)
@@ -1510,6 +1544,8 @@ class AsyncMCPServer:
                 writer.write(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
             cors = (f'Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n'.encode() if origin else b'')
             if method == 'OPTIONS':
+                if not origin:
+                    writer.write(b'HTTP/1.1 405 Method Not Allowed\r\nAllow: POST, OPTIONS\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
                 writer.write(b'HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n' + cors + b'Access-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, MCP-Protocol-Version, Authorization\r\n\r\n'); await writer.drain(); return
             if method != 'POST' or path != endpoint:
                 writer.write(b'HTTP/1.1 405 Method Not Allowed\r\nAllow: POST, OPTIONS\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
@@ -1640,7 +1676,7 @@ class AsyncMCPServer:
             try:
                 with open(args[0], encoding='utf-8') as f:
                     input_data = f.read()
-                response = await self.process_request_async(input_data)
+                response = await self.process_request_async(input_data, context=MCPRequestContext(transport="file"))
                 if response is not None:
                     payload = (dumps(response) + "\n").encode('utf-8')
                     _stdout_bin.write(payload); _stdout_bin.flush()
@@ -1652,7 +1688,7 @@ class AsyncMCPServer:
                 if not raw: break
                 line = raw.decode('utf-8', errors='replace').strip()
                 if not line: continue
-                response = await self.process_request_async(line)
+                response = await self.process_request_async(line, context=MCPRequestContext(transport="stdio"))
                 if response is not None:
                     payload = (dumps(response) + "\n").encode('utf-8')
                     _stdout_bin.write(payload); _stdout_bin.flush()

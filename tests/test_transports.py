@@ -25,6 +25,7 @@ import time
 import urllib.request
 from contextlib import closing
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import pytest
 
@@ -131,6 +132,113 @@ def test_sync_tcp_transport_round_trip(script) -> None:
             assert "result" in resp
     finally:
         _kill(proc)
+
+
+# ---------- sync streamable HTTP transport ---------------------------------
+
+
+def _http_request(host: str, port: int, request: bytes, *, shutdown_write: bool = False) -> bytes:
+    with closing(socket.create_connection((host, port), timeout=2.0)) as sock:
+        sock.settimeout(2.0)
+        sock.sendall(request)
+        if shutdown_write:
+            sock.shutdown(socket.SHUT_WR)
+        buf = b""
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+
+def test_sync_streamable_http_round_trip_and_error_paths() -> None:
+    proc = _spawn("calculator_server.py", "--port", "0", "--http")
+    try:
+        port = _wait_for_port(proc.stdout)
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode("utf-8")
+        response = _http_request(
+            "127.0.0.1",
+            port,
+            (
+                b"POST /mcp HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Accept: application/json\r\n"
+                b"MCP-Protocol-Version: 2025-03-26\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                + body
+            ),
+        )
+        assert b"200 OK" in response and b'"tools"' in response
+
+        no_origin = _http_request(
+            "127.0.0.1", port,
+            b"OPTIONS /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+        )
+        assert b"405 Method Not Allowed" in no_origin
+        assert b"Allow: POST, OPTIONS" in no_origin
+
+        short_body = _http_request(
+            "127.0.0.1",
+            port,
+            b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json\r\nMCP-Protocol-Version: 2025-03-26\r\nContent-Length: 5\r\n\r\n{}",
+            shutdown_write=True,
+        )
+        assert b"400 Bad Request" in short_body
+    finally:
+        _kill(proc)
+
+
+def test_sync_streamable_http_auth_401_and_403() -> None:
+    script = NamedTemporaryFile("w", suffix=".py", delete=False, dir=str(ROOT))
+    try:
+        script.write(
+            "from umcp import MCPServer\n"
+            "from umcp_shared import MCPPrincipal\n"
+            "class S(MCPServer):\n"
+            "    def authenticate_request(self, *, method, path, headers, peer):\n"
+            "        return MCPPrincipal(name='alice') if headers.get('authorization') == 'Bearer ok' else None\n"
+            "    def authorize_request(self, principal, *, rpc_method, tool_name):\n"
+            "        return tool_name != 'forbidden'\n"
+            "    def tool_forbidden(self):\n"
+            "        return 'x'\n"
+            "S().run()\n"
+        )
+        script.flush(); script.close()
+        proc = subprocess.Popen(
+            [sys.executable, script.name, "--port", "0", "--http"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+            cwd=str(ROOT),
+        )
+        try:
+            port = _wait_for_port(proc.stdout)
+            body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "forbidden"}}).encode("utf-8")
+            unauthorized = _http_request(
+                "127.0.0.1",
+                port,
+                (
+                    b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json\r\nMCP-Protocol-Version: 2025-03-26\r\n"
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+                ),
+            )
+            assert b"401 Unauthorized" in unauthorized
+            forbidden = _http_request(
+                "127.0.0.1",
+                port,
+                (
+                    b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json\r\nAuthorization: Bearer ok\r\nMCP-Protocol-Version: 2025-03-26\r\n"
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+                ),
+            )
+            assert b"403 Forbidden" in forbidden
+        finally:
+            _kill(proc)
+    finally:
+        os.unlink(script.name)
 
 
 # ---------- sync SSE transport ---------------------------------------------

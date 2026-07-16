@@ -74,19 +74,26 @@ translation on Windows will corrupt JSON-RPC framing in subtle ways.
 A stateless `POST /mcp` accepts one JSON-RPC message and returns either a
 JSON response (`200`) or an empty notification acknowledgement (`202`).
 `GET` and `DELETE` return `405` because this first implementation has no
-stateful sessions or server-initiated stream. Non-initialize requests must
-carry a supported `MCP-Protocol-Version`. The transport validates media
-types, response negotiation, Origins, authentication/authorization hooks,
-and a 4 MiB default body limit. It binds to loopback unless `--host` is
-explicitly supplied. Remote deployments should override
-`authenticate_request()` and `authorize_request()` or put the service behind
-a trusted authenticating reverse proxy. Session IDs, if added later, are
-routing identifiers rather than credentials.
+stateful sessions or server-initiated stream. `OPTIONS` is only enabled for
+actual browser preflight requests carrying an allowed `Origin`; stray or
+proxy-generated `OPTIONS` without `Origin` get `405`, and disallowed Origins
+get `403`. Non-initialize requests must carry a supported
+`MCP-Protocol-Version`. The transport validates media types, response
+negotiation, Origins, authentication/authorization hooks, and a 4 MiB
+default body limit, with deterministic `400` handling for malformed or
+short request bodies. It binds to loopback unless `--host` is explicitly
+supplied. Remote deployments should override `authenticate_request()` and
+`authorize_request()` or put the service behind a trusted authenticating
+reverse proxy. Session IDs, if added later, are routing identifiers rather
+than credentials.
 
 Request metadata is exposed safely through `get_request_context()`, backed
 by `contextvars`, so concurrent threads and asyncio tasks cannot overwrite
 one another. The context includes transport, JSON-RPC ID, negotiated version,
-principal name, peer and immutable request headers.
+principal name, peer and immutable request headers. `MCPRequestContext`
+and `MCPPrincipal` defensively copy mapping inputs into immutable
+`MappingProxyType` wrappers so hooks cannot mutate shared state after the
+fact.
 
 **Legacy SSE** (`--port N`, or `--transport sse`). HTTP server bound to `127.0.0.1:N` implementing
 the MCP Server-Sent Events transport: `GET /sse` opens the event
