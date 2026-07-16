@@ -1,9 +1,10 @@
 # Architecture
 
 `umcp` is a small, dependency-free implementation of the [Model Context
-Protocol][mcp] in Python. The whole library is two files -- `umcp.py`
-for synchronous servers, `aioumcp.py` for asynchronous ones -- and the
-shape of both is the same: a base class that introspects subclass
+Protocol][mcp] in Python. `umcp.py` contains the synchronous server,
+`aioumcp.py` contains its asynchronous sibling, and `umcp_shared.py` keeps
+protocol versions, immutable principals, and request-local context from
+drifting between them. Both base classes introspect subclass
 methods, generates JSON Schema from their type hints, and serves a
 JSON-RPC 2.0 protocol over stdio, Streamable HTTP, legacy SSE, or TCP.
 
@@ -106,8 +107,8 @@ by default because there's no auth model -- if you need to expose it,
 front it with a reverse proxy that handles authentication.
 
 **TCP** (`--port N --tcp`). Raw TCP socket with newline-delimited
-JSON-RPC. Effectively stdio over a socket. Kept for compatibility with
-older clients that predate SSE; new deployments should prefer SSE.
+JSON-RPC. Effectively stdio over a socket. It is kept for compatibility
+with older clients; new network deployments should prefer Streamable HTTP.
 
 The transport layer is small and lives at the bottom of each base
 class. The protocol handler doesn't know which transport is in use --
@@ -334,10 +335,13 @@ quickly or don't have meaningful intermediate state. Adding streaming
 would complicate every tool author's contract for the benefit of a
 small minority. A future addition, if the use case becomes common.
 
-*No authentication.* The stdio transport is owned by the host process,
-which is the security boundary. The SSE and TCP transports bind to
-localhost. If you need authenticated remote access, put a reverse
-proxy in front of SSE; the library doesn't try to be one.
+*No built-in authentication backend or policy engine.* The stdio transport
+is owned by the host process, which is its security boundary. Streamable
+HTTP exposes `authenticate_request()` and `authorize_request()` hooks and
+stores the resulting principal in immutable request context. Applications
+still own credential validation and role policy; a trusted reverse proxy is
+also a sensible boundary. Legacy SSE and TCP bind to localhost and do not
+use the HTTP hooks.
 
 *No concurrency in the synchronous version.* `MCPServer` handles one
 request at a time. Given that MCP over stdio is inherently
@@ -413,14 +417,17 @@ layer of the library at a time:
   buffer to assert that `notifications/resources/list_changed` and
   `notifications/resources/updated` actually go out, and that
   subscription gating works).
-* **Transports** -- `test_async_servers.py` (async stdio over
-  subprocess), `test_transports.py` (sync stdio, sync TCP, sync SSE
-  end-to-end).
+* **Transports** -- `test_async_servers.py` (async stdio over subprocess),
+  `test_transports.py` (sync stdio, TCP, legacy SSE, and Streamable HTTP
+  subprocess tests), `test_streamable_http_sync_async.py` (parity), and
+  `test_streamable_http_regressions.py` (auth, negotiation, limits, Origin,
+  CORS, context isolation, and remote-safe failures).
 
 End-to-end suites spawn the example servers as subprocesses and
 round-trip JSON-RPC requests; this catches transport and framing bugs
 the unit tests can't see (Windows CRLF translation, blocking-stdout
-buffering, SSE event framing).
+buffering, SSE event framing, HTTP status/header construction, and bounded
+request reads).
 
 A `Makefile` wraps the common operations:
 

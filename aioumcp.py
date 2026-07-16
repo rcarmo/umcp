@@ -1200,6 +1200,12 @@ class AsyncMCPServer:
             error = self.create_error(-32600, "Invalid Request: Not a JSON-RPC 2.0 request")
             return self.create_response(request_id, None, error)
 
+        if method is None and ("result" in request or "error" in request):
+            return None  # A client response is acknowledged by the transport.
+        if not isinstance(method, str):
+            error = self.create_error(-32600, "Invalid Request: method must be a string")
+            return self.create_response(request_id, None, error)
+
         if context is None:
             context = MCPRequestContext(request_id=request_id)
         else:

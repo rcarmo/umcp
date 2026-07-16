@@ -182,6 +182,15 @@ def test_sync_streamable_http_round_trip_and_error_paths() -> None:
         assert b"405 Method Not Allowed" in no_origin
         assert b"Allow: POST, OPTIONS" in no_origin
 
+        oversized_header = _http_request(
+            "127.0.0.1",
+            port,
+            b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Oversized: "
+            + (b"x" * 65536)
+            + b"\r\nContent-Length: 0\r\n\r\n",
+        )
+        assert b"431 Line too long" in oversized_header
+
         short_body = _http_request(
             "127.0.0.1",
             port,

@@ -11,9 +11,10 @@ with proper introspection -- type hints to JSON Schema, naming
 conventions to MCP annotations, no decorator boilerplate, and the whole
 thing readable in an afternoon.
 
-The library is two files (`umcp.py` and `aioumcp.py`), no third-party
-dependencies, supports stdio / SSE / TCP transports, and ships with a
-handful of runnable examples in [`examples/`](examples/).
+The runtime is three files: `umcp.py`, `aioumcp.py`, and the shared
+`umcp_shared.py`. It has no third-party runtime dependencies, supports
+stdio, stateless Streamable HTTP, legacy HTTP+SSE, and raw TCP, and ships
+with a handful of runnable examples in [`examples/`](examples/).
 
 ---
 
@@ -23,6 +24,7 @@ handful of runnable examples in [`examples/`](examples/).
 * [Requirements](#-requirements)
 * [Installation](#-installation)
 * [Quick start](#-quick-start)
+* [Transports](#-transports)
 * [Architecture](#%EF%B8%8F-architecture)
 * [Getting started tutorial](#-getting-started-tutorial)
 * [Examples](#-examples)
@@ -33,6 +35,7 @@ handful of runnable examples in [`examples/`](examples/).
 * [Development](#%EF%B8%8F-development)
 * [Integration (VS Code, Claude Desktop)](#-integration)
 * [Limitations](#-limitations)
+* [Deployment notes](#-deployment-notes)
 * [Troubleshooting](#-troubleshooting)
 * [Further reading](#-further-reading)
 * [License](#-license)
@@ -65,7 +68,7 @@ handful of runnable examples in [`examples/`](examples/).
 ```bash
 git clone https://github.com/rcarmo/umcp
 cd umcp
-python examples/movie_server.py --help
+python -m py_compile umcp.py aioumcp.py umcp_shared.py
 ```
 
 No additional packages required -- `umcp` uses only the Python
@@ -95,6 +98,34 @@ echo '{"jsonrpc": "2.0", "method": "tools/list", "id": 1}' \
 echo '{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "add", "arguments": {"a": 5, "b": 3}}, "id": 1}' \
   | python ./examples/calculator_server.py
 ```
+
+---
+
+## 🚚 Transports
+
+stdio remains the default and is the right choice when the MCP host launches
+the server locally. Plain `--port N` deliberately retains the old SSE
+behaviour for compatibility; new network deployments should select
+Streamable HTTP explicitly.
+
+| Transport | Invocation | Intended use |
+|---|---|---|
+| stdio | `python server.py` | Local child-process integrations |
+| Streamable HTTP | `python server.py --port 9000 --http` | New network services; stateless `POST /mcp` |
+| legacy SSE | `python server.py --port 9000 --sse` | Existing HTTP+SSE clients; deprecated, with no removal date |
+| raw TCP | `python server.py --port 9000 --tcp` | Legacy compatibility only |
+
+The equivalent explicit form is `--transport stdio|streamable-http|sse|tcp`.
+Network transports also accept `--host`, `--endpoint`,
+`--max-request-bytes`, and repeatable `--allowed-origin` options. Conflicting
+aliases and network transports without `--port` are rejected.
+
+Streamable HTTP accepts one JSON-RPC object per `POST`. Requests return
+`200 application/json`; notifications and client responses return `202`.
+The initial `initialize` negotiates either `2025-03-26` or `2024-11-05`.
+Later requests must send a supported value in `MCP-Protocol-Version`.
+Stateless `GET` and `DELETE` return `405`. Browser preflight is only enabled
+for an allowed `Origin`.
 
 ---
 
@@ -356,13 +387,50 @@ Base class for synchronous MCP servers.
 * `handle_prompt_get()` -- dispatches a prompt fetch.
 * `get_config()` -- override to declare server name, version, capabilities.
 * `get_instructions()` -- override to give the model session-level guidance.
-* `run()` -- start the server on the configured transport (stdio by default; pass `--port N` for SSE, `--http` for streamable HTTP, add `--tcp` for raw TCP, or use `--transport {sse,streamable-http,tcp}`).
+* `run()` -- start the server on the configured transport (stdio by default; plain `--port N` retains legacy SSE, `--http` selects Streamable HTTP, and `--tcp` selects raw TCP).
+* `authenticate_request()` / `authorize_request()` -- optional HTTP identity and policy hooks. The default principal is anonymous for compatibility.
+* `get_request_context()` -- return immutable request-local transport, protocol, principal, peer, and header metadata.
 
 #### `AsyncMCPServer` (`aioumcp.py`)
 
 Same surface, but `tool_*` and `prompt_*` methods may be `async def`.
 Use this when your tools are network-bound; use `MCPServer` when
 they're local-disk or compute-bound.
+
+### Request identity and context
+
+Remote services can validate HTTP credentials without turning identity into
+a model-controlled tool argument:
+
+```python
+from typing import Mapping
+from umcp import MCPServer, MCPPrincipal, get_request_context
+
+class PrivateServer(MCPServer):
+    def authenticate_request(
+        self, *, method: str, path: str,
+        headers: Mapping[str, str], peer: str | None,
+    ) -> MCPPrincipal | None:
+        if headers.get("authorization") != "Bearer expected-token":
+            return None
+        return MCPPrincipal(name="alice", roles=("reader",))
+
+    def authorize_request(
+        self, principal: MCPPrincipal | None, *,
+        rpc_method: str | None, tool_name: str | None,
+    ) -> bool:
+        return principal is not None and (
+            tool_name != "write" or "writer" in principal.roles
+        )
+
+    def tool_whoami(self) -> str:
+        return get_request_context().principal or "local"
+```
+
+Authentication failure is an HTTP `401`; authorization failure is `403`.
+The context is reset in `finally` after every dispatch and is isolated across
+threads, asyncio tasks, and executor workers. `MCPPrincipal.metadata` and
+`MCPRequestContext.headers` are defensive immutable copies.
 
 ### Tool method signature
 
@@ -432,10 +500,14 @@ python -m pytest tests/test_resources.py -v
 | `test_resources.py` | resources/list, /templates/list, /read, subscribe/unsubscribe, dynamic registration, capability declaration |
 | `test_notifications.py` | `notifications/resources/list_changed` and `notifications/resources/updated` emission and subscription gating |
 | `test_async_servers.py` | async stdio subprocess round-trips |
-| `test_transports.py` | sync stdio, sync TCP, sync SSE end-to-end |
+| `test_transports.py` | sync stdio, TCP, legacy SSE, and Streamable HTTP subprocess tests |
+| `test_shared_negotiation_context.py` | protocol negotiation and immutable request/principal context |
+| `test_streamable_http_sync_async.py` | matching sync/async Streamable HTTP dispatch |
+| `test_streamable_http_regressions.py` | auth, Origin, CORS, limits, context isolation, CLI, and remote-safe errors |
 | `simple_async_test.py` | smoke tests for the async base |
 
-At last count: **131 tests** covering both the sync and async bases.
+The current suite has **163 tests** covering both bases and runs on Python
+3.10, 3.11, and 3.12.
 
 ---
 
@@ -474,6 +546,8 @@ python -m pytest tests/
 umcp/
 ├── umcp.py                -- sync MCPServer base class
 ├── aioumcp.py             -- async AsyncMCPServer base class
+├── umcp_shared.py         -- versions, principals, and request context
+├── scripts/               -- optional compatibility smoke tests
 ├── examples/              -- runnable example servers
 │   ├── movie_server.py
 │   ├── async_movie_server.py
@@ -532,9 +606,10 @@ Then `/mcp my-weather-server get weather for New York` from Copilot Chat.
 ## 🚫 Limitations
 
 * No streaming responses -- partial results aren't supported.
-* No built-in authentication -- the stdio transport is owned by the
-  host process; SSE/TCP bind to localhost. Front with a reverse proxy
-  if you need authenticated remote access.
+* No built-in authentication backend or policy engine. Streamable HTTP
+  exposes `authenticate_request()` and `authorize_request()` hooks, and
+  reverse proxies can supply trusted identity, but the application owns
+  credentials, roles, and policy.
 * No concurrency in the synchronous version -- one request at a time.
   Use `AsyncMCPServer` if you need overlapping I/O.
 
@@ -585,7 +660,28 @@ WantedBy=multi-user.target
 
 Container deployments should follow the same pattern: keep the container
 port private, expose it through a reverse proxy, and do not publish raw
-SSE/TCP unless you have a separate auth story.
+SSE/TCP unless you have a separate auth story. Session IDs, if stateful
+HTTP support is added later, are routing identifiers rather than credentials.
+
+### Piclaw compatibility smoke test
+
+Piclaw's `pi-mcp-adapter` uses the official MCP SDK's
+`StreamableHTTPClientTransport` before considering its legacy SSE fallback.
+The repository includes a repeatable smoke test for that exact transport:
+
+```bash
+# Terminal 1
+python examples/calculator_server.py --port 9000 --http
+
+# Terminal 2 -- point this at Piclaw's bundled SDK directory
+MCP_URL=http://127.0.0.1:9000/mcp \
+MCP_SDK_ROOT=/path/to/piclaw/node_modules/@modelcontextprotocol/sdk \
+  bun scripts/piclaw_streamable_http_smoke.ts
+```
+
+A successful run connects without SSE, discovers the calculator tools, and
+calls `add(2, 3)`. This is an optional compatibility check; Bun and the MCP
+SDK are not runtime dependencies of `umcp`.
 
 ---
 
