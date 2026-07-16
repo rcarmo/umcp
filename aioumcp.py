@@ -69,6 +69,16 @@ from typing import Any, Literal, Union, get_args, get_origin, get_type_hints, is
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
+from umcp_shared import (
+    MCPPrincipal,
+    MCPRequestContext,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    exact_or_fallback,
+    get_request_context,
+    reset_request_context,
+    set_request_context,
+)
+
 
 class AsyncMCPServer:
     """Async MCP server implementation using JSON-RPC 2.0 protocol with asyncio."""
@@ -116,7 +126,7 @@ class AsyncMCPServer:
           * Dynamic instructions string
         """
         return {
-            "protocolVersion": "2025-03-26",
+            "protocolVersion": SUPPORTED_PROTOCOL_VERSIONS[0],
             "serverInfo": {
                 "name": self.__class__.__name__,
                 "version": "0.1.0"
@@ -139,7 +149,7 @@ class AsyncMCPServer:
 
     def get_instructions(self) -> str:
         """Get server-specific instructions. Override in subclasses."""
-        return "Base MCP server with dynamic tool discovery."
+        return "This server provides tool functionality via the Model Context Protocol."
 
     def discover_tools(self) -> dict[str, Any]:
         """Discover tools by introspecting methods that start with 'tool_'.
@@ -975,8 +985,10 @@ class AsyncMCPServer:
 
     def handle_initialize(self, request_id: int, params: dict[str, Any]) -> dict[str, Any]:
         """Handle initialize request."""
-        _ = params  # Acknowledge params parameter
         config = self.get_config()
+        config["protocolVersion"] = exact_or_fallback(
+            params.get("protocolVersion"), SUPPORTED_PROTOCOL_VERSIONS[0]
+        )
         return self.create_response(request_id, config)
 
     def handle_tools_list(self, request_id: int) -> dict[str, Any]:
@@ -1061,7 +1073,8 @@ class AsyncMCPServer:
         except Exception as e:
             tb = traceback.format_exc()
             self.logger.error("TOOL ERROR: %s failed with %s: %s\n%s", tool_name, type(e).__name__, e, tb)
-            error = self.create_error(-32603, f"Tool execution error for {tool_name}: {type(e).__name__}: {str(e)}")
+            message = "Tool execution failed" if get_request_context().transport == "streamable-http" else f"Tool execution error for {tool_name}: {type(e).__name__}: {str(e)}"
+            error = self.create_error(-32603, message)
             return self.create_response(request_id, None, error)
 
         self.logger.info("TOOL SUCCESS: %s returned type: %s", tool_name, type(content).__name__)
@@ -1110,8 +1123,19 @@ class AsyncMCPServer:
             error["data"] = data
         return error
 
-    async def process_request_async(self, request_data: str) -> dict[str, Any] | None:
-        """Process a JSON-RPC 2.0 request asynchronously."""
+    def authenticate_request(self, *, method: str, path: str, headers: dict[str, str], peer: str | None) -> MCPPrincipal | None:
+        return MCPPrincipal(name="anonymous")
+
+    def authorize_request(self, principal: MCPPrincipal | None, *, rpc_method: str, tool_name: str | None) -> bool:
+        return True
+
+    def _with_request_context(self, *, transport: str | None, request_id: str | int | None, principal: str | None, peer: str | None, headers: dict[str, str], version: str | None, session_id: str | None = None):
+        return set_request_context(MCPRequestContext(transport=transport, request_id=request_id, protocol_version=version, session_id=session_id, principal=principal, peer=peer, headers=headers))
+
+    async def process_request_async(
+        self, request_data: str, *, context: MCPRequestContext | None = None
+    ) -> dict[str, Any] | None:
+        """Process a JSON-RPC 2.0 request asynchronously in an isolated context."""
         try:
             request = loads(request_data)
         except JSONDecodeError as e:
@@ -1143,34 +1167,50 @@ class AsyncMCPServer:
             error = self.create_error(-32600, "Invalid Request: Not a JSON-RPC 2.0 request")
             return self.create_response(request_id, None, error)
 
-        # Process the method
-        if method == "initialize":
-            return self.handle_initialize(request_id, params)
-        elif method == "tools/list":
-            return self.handle_tools_list(request_id)
-        elif method == "tools/call":
-            return await self.handle_tools_call_async(request_id, params)
-        elif method == "prompts/list":
-            result = self.discover_prompts()
-            return self.create_response(request_id, result)
-        elif method == "prompts/get":
-            return await self.handle_prompt_get_async(request_id, params)
-        elif method == "resources/list":
-            return self.handle_resources_list(request_id, params)
-        elif method == "resources/templates/list":
-            return self.handle_resources_templates_list(request_id, params)
-        elif method == "resources/read":
-            return await self.handle_resources_read_async(request_id, params)
-        elif method == "resources/subscribe":
-            return self.handle_resources_subscribe(request_id, params)
-        elif method == "resources/unsubscribe":
-            return self.handle_resources_unsubscribe(request_id, params)
-        elif method == "notifications/initialized":
-            self.logger.info("Host confirmed toolContract reception with 'notifications/initialized'")
-            return None
+        if context is None:
+            context = MCPRequestContext(request_id=request_id)
         else:
-            error = self.create_error(-32601, f"Method not found: {method}")
-            return self.create_response(request_id, None, error)
+            context = MCPRequestContext(
+                transport=context.transport,
+                request_id=request_id,
+                protocol_version=context.protocol_version,
+                session_id=context.session_id,
+                principal=context.principal,
+                peer=context.peer,
+                headers=context.headers,
+            )
+        token = set_request_context(context)
+        try:
+            # Process the method
+            if method == "initialize":
+                return self.handle_initialize(request_id, params)
+            elif method == "tools/list":
+                return self.handle_tools_list(request_id)
+            elif method == "tools/call":
+                return await self.handle_tools_call_async(request_id, params)
+            elif method == "prompts/list":
+                result = self.discover_prompts()
+                return self.create_response(request_id, result)
+            elif method == "prompts/get":
+                return await self.handle_prompt_get_async(request_id, params)
+            elif method == "resources/list":
+                return self.handle_resources_list(request_id, params)
+            elif method == "resources/templates/list":
+                return self.handle_resources_templates_list(request_id, params)
+            elif method == "resources/read":
+                return await self.handle_resources_read_async(request_id, params)
+            elif method == "resources/subscribe":
+                return self.handle_resources_subscribe(request_id, params)
+            elif method == "resources/unsubscribe":
+                return self.handle_resources_unsubscribe(request_id, params)
+            elif method == "notifications/initialized":
+                self.logger.info("Host confirmed toolContract reception with 'notifications/initialized'")
+                return None
+            else:
+                error = self.create_error(-32601, f"Method not found: {method}")
+                return self.create_response(request_id, None, error)
+        finally:
+            reset_request_context(token)
 
     # ==== Main execution ====
 
@@ -1383,6 +1423,96 @@ class AsyncMCPServer:
         await writer.drain()
         writer.close()
 
+    async def run_streamable_http_async(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        endpoint: str = "/mcp",
+        allowed_origins: list[str] | None = None,
+        max_request_bytes: int = 4 * 1024 * 1024,
+    ) -> None:
+        allowed_origins = allowed_origins or []
+        if host not in ("127.0.0.1", "localhost", "::1") and type(self).authenticate_request is AsyncMCPServer.authenticate_request:
+            self.logger.warning("Streamable HTTP is bound beyond loopback without an authentication hook")
+        server = await start_server(
+            lambda r, w: self._handle_streamable_http_client(
+                r, w, endpoint, allowed_origins, max_request_bytes, host
+            ),
+            host,
+            port,
+        )
+        addrs = [s.getsockname() for s in server.sockets]
+        for addr in addrs:
+            print(f"MCP Streamable HTTP Server listening on http://{addr[0]}:{addr[1]}{endpoint}", flush=True)
+        async with server:
+            await server.serve_forever()
+
+    async def _handle_streamable_http_client(
+        self, reader: StreamReader, writer: StreamWriter, endpoint: str,
+        allowed_origins: list[str], max_request_bytes: int,
+        host: str = "127.0.0.1",
+    ) -> None:
+        peer = writer.get_extra_info('peername')
+        try:
+            line = await reader.readline()
+            if not line:
+                return
+            method, path, _ = line.decode('utf-8', errors='replace').strip().split(' ', 2)
+            headers: dict[str,str]={}
+            while True:
+                h = await reader.readline()
+                if h in (b'\r\n', b'\n', b''): break
+                k,_,v=h.decode('utf-8', errors='replace').partition(':')
+                headers[k.strip().lower()] = v.strip()
+            n=int(headers.get('content-length','0') or '0')
+            if n>max_request_bytes:
+                writer.write(b'HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+            body=await reader.readexactly(n) if n else b''
+            origin=headers.get('origin')
+            if origin and origin not in allowed_origins and not (host in ('127.0.0.1','localhost','::1') and origin.startswith('http://127.0.0.1')):
+                writer.write(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+            if method == 'OPTIONS':
+                writer.write(b'HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, MCP-Protocol-Version, Authorization\r\n\r\n'); await writer.drain(); return
+            if method != 'POST' or path != endpoint:
+                writer.write(b'HTTP/1.1 405 Method Not Allowed\r\nAllow: POST, OPTIONS\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+            if headers.get('content-type','').split(';')[0].strip() != 'application/json':
+                writer.write(b'HTTP/1.1 415 Unsupported Media Type\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+            if 'application/json' not in headers.get('accept','*/*') and '*/*' not in headers.get('accept','*/*'):
+                writer.write(b'HTTP/1.1 406 Not Acceptable\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+            principal = self.authenticate_request(method='POST', path=path, headers=headers, peer=peer[0] if peer else None)
+            if principal is None:
+                writer.write(b'HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+            try:
+                req = loads(body.decode('utf-8'))
+            except JSONDecodeError:
+                resp = self.create_response(None, None, self.create_error(-32700,'Parse error'))
+                data=(dumps(resp)+'\n').encode(); writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n\r\n'.encode()+data); await writer.drain(); return
+            version = headers.get('mcp-protocol-version')
+            if req.get('method') != 'initialize' and version not in SUPPORTED_PROTOCOL_VERSIONS:
+                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+            if not isinstance(req, dict):
+                resp = self.create_response(None, None, self.create_error(-32600, 'Invalid Request'))
+                data = dumps(resp).encode()
+                writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n\r\n'.encode() + data)
+                await writer.drain(); return
+            rpc_method = req.get('method')
+            params = req.get('params') if isinstance(req.get('params'), dict) else {}
+            tool_name = params.get('name') if rpc_method == 'tools/call' else None
+            if not self.authorize_request(principal, rpc_method=rpc_method, tool_name=tool_name):
+                writer.write(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+            context = MCPRequestContext(
+                transport='streamable-http', request_id=req.get('id'),
+                protocol_version=version, session_id=None,
+                principal=principal.name if principal else None,
+                peer=peer[0] if peer else None, headers=headers,
+            )
+            response = await self.process_request_async(dumps(req), context=context)
+            if response is None:
+                writer.write(b'HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+            data=(dumps(response)+'\n').encode(); writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n\r\n'.encode()+data); await writer.drain()
+        finally:
+            writer.close()
+
     async def run_sse_async(self, host: str = "127.0.0.1", port: int = 0) -> None:
         """Run the MCP server over HTTP with the SSE transport.
 
@@ -1411,102 +1541,64 @@ class AsyncMCPServer:
             await server.serve_forever()
 
     async def run_async(self, args: list[str] | None = None) -> None:
-        """Run the MCP server asynchronously."""
         if args is None:
             args = argv[1:]
-
-        # ---- Parse --port / --host / --tcp flags ----
         port: int | None = None
         host: str = "127.0.0.1"
         use_tcp: bool = False
+        transport: str | None = None
+        endpoint = "/mcp"
+        max_request_bytes = 4 * 1024 * 1024
+        allowed_origins: list[str] = []
         remaining: list[str] = []
         i = 0
         while i < len(args):
             if args[i] in ("--port", "-p") and i + 1 < len(args):
-                port = int(args[i + 1])
-                i += 2
-            elif args[i] in ("--host",) and i + 1 < len(args):
-                host = args[i + 1]
-                i += 2
+                port = int(args[i + 1]); i += 2
+            elif args[i] == "--host" and i + 1 < len(args):
+                host = args[i + 1]; i += 2
+            elif args[i] == "--endpoint" and i + 1 < len(args):
+                endpoint = args[i + 1]; i += 2
+            elif args[i] == "--max-request-bytes" and i + 1 < len(args):
+                max_request_bytes = int(args[i + 1]); i += 2
+            elif args[i] == "--allowed-origin" and i + 1 < len(args):
+                allowed_origins.append(args[i + 1]); i += 2
             elif args[i] == "--tcp":
-                use_tcp = True
-                i += 1
+                use_tcp = True; transport = "tcp"; i += 1
+            elif args[i] in ("--http", "--sse"):
+                transport = "streamable-http" if args[i] == "--http" else "sse"; i += 1
             else:
-                remaining.append(args[i])
-                i += 1
-
+                remaining.append(args[i]); i += 1
         if port is not None:
-            if use_tcp:
+            mode = transport or ("tcp" if use_tcp else "sse")
+            if mode == "tcp":
                 await self.run_socket_async(host=host, port=port)
+            elif mode == "streamable-http":
+                await self.run_streamable_http_async(host=host, port=port, endpoint=endpoint, allowed_origins=allowed_origins, max_request_bytes=max_request_bytes)
             else:
                 await self.run_sse_async(host=host, port=port)
             return
-
-        # ---- Original stdio / file transport ----
         args = remaining
-
-        # Check if reading from a file or continuous stdin
         if args:
-            # Read from file if provided as argument
             try:
                 with open(args[0], encoding='utf-8') as f:
                     input_data = f.read()
-
-                # Log the input
-                self.logger.info("REQUEST: %s", input_data)
-
-                # Process the JSON-RPC 2.0 request
                 response = await self.process_request_async(input_data)
-
                 if response is not None:
-                    # Output the response via binary buffer
-                    payload = (dumps(response) + "\n").encode("utf-8")
-                    _stdout_bin.write(payload)
-                    _stdout_bin.flush()
-
+                    payload = (dumps(response) + "\n").encode('utf-8')
+                    _stdout_bin.write(payload); _stdout_bin.flush()
             except OSError as e:
-                self.logger.error("Error reading file %s: %s", args[0], e)
-                exit(1)
+                self.logger.error("Error reading file %s: %s", args[0], e); exit(1)
         else:
-            # Continuously read from stdin line by line using asyncio.
-            # We read/write via the raw binary buffers (_stdin_bin / _stdout_bin)
-            # to avoid text-mode buffering and CRLF translation on Windows.
-            self.logger.info("Async MCP Server started. Waiting for JSON-RPC 2.0 messages...")
-
-            try:
-                while True:
-                    try:
-                        raw = await get_event_loop().run_in_executor(None, _stdin_bin.readline)
-                        if not raw:  # EOF
-                            break
-
-                        line = raw.decode("utf-8", errors="replace").strip()
-
-                        # Skip empty lines
-                        if not line:
-                            continue
-
-                        # Log the input
-                        self.logger.info("REQUEST: %s", line)
-
-                        # Process the JSON-RPC 2.0 request
-                        response = await self.process_request_async(line)
-
-                        if response is not None:
-                            # Output the response via binary buffer
-                            payload = (dumps(response) + "\n").encode("utf-8")
-                            _stdout_bin.write(payload)
-                            _stdout_bin.flush()
-
-                    except CancelledError:
-                        break
-
-            except KeyboardInterrupt:
-                self.logger.info("Async MCP Server stopped.")
-                exit(0)
-            except Exception as e:  # noqa: BLE001 broad for runtime resilience
-                self.logger.error("Async MCP Server error: %s", e)
-                exit(1)
+            while True:
+                raw = await get_event_loop().run_in_executor(None, _stdin_bin.readline)
+                if not raw: break
+                line = raw.decode('utf-8', errors='replace').strip()
+                if not line: continue
+                response = await self.process_request_async(line)
+                if response is not None:
+                    payload = (dumps(response) + "\n").encode('utf-8')
+                    _stdout_bin.write(payload); _stdout_bin.flush()
 
     def run(self, args: list[str] | None = None) -> None:
         """Synchronous wrapper to run the async MCP server."""

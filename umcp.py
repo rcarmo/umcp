@@ -55,9 +55,19 @@ from inspect import (
     ismethod,
     signature,
 )
+from contextvars import copy_context
 from json import JSONDecodeError, dumps, loads
 from logging import INFO, FileHandler, basicConfig, getLogger
 from pathlib import Path
+from umcp_shared import (
+    MCPPrincipal,
+    MCPRequestContext,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    exact_or_fallback,
+    get_request_context,
+    reset_request_context,
+    set_request_context,
+)
 from queue import Empty, Queue
 from sys import argv, exit
 from types import UnionType
@@ -110,7 +120,7 @@ class MCPServer:
     def get_config(self) -> dict[str, Any]:
         """Generate server configuration dynamically."""
         return {
-            "protocolVersion": "2025-03-26",
+            "protocolVersion": SUPPORTED_PROTOCOL_VERSIONS[0],
             "serverInfo": {
                 "name": self.__class__.__name__,
                 "version": "0.1.0"
@@ -978,6 +988,9 @@ class MCPServer:
         client_info = params.get('clientInfo', {})
         self.logger.info("Initialize request from client: %s", client_info)
         result = self.get_config()
+        result["protocolVersion"] = exact_or_fallback(
+            params.get("protocolVersion"), SUPPORTED_PROTOCOL_VERSIONS[0]
+        )
         return self.create_response(request_id, result, None)
 
     def handle_tools_list(self, request_id: str | int | None) -> dict[str, Any]:
@@ -1054,9 +1067,8 @@ class MCPServer:
         except Exception as e:
             tb = traceback.format_exc()
             self.logger.error("TOOL ERROR: %s failed with %s: %s\n%s", tool_name, type(e).__name__, e, tb)
-            error = self.create_error(
-                -32603, f"Tool execution error for {tool_name}: {type(e).__name__}: {str(e)}"
-            )
+            message = "Tool execution failed" if get_request_context().transport == "streamable-http" else f"Tool execution error for {tool_name}: {type(e).__name__}: {str(e)}"
+            error = self.create_error(-32603, message)
             return self.create_response(request_id, None, error)
 
         self.logger.info("TOOL SUCCESS: %s returned type: %s", tool_name, type(content).__name__)
@@ -1096,8 +1108,26 @@ class MCPServer:
             error["data"] = data
         return error
 
-    def process_request(self, input_data: str) -> dict[str, Any] | None:
-        """Process a JSON-RPC 2.0 request."""
+    def authenticate_request(self, *, method: str, path: str, headers: dict[str, str], peer: str | None) -> MCPPrincipal | None:
+        return MCPPrincipal(name="anonymous")
+
+    def authorize_request(self, principal: MCPPrincipal | None, *, rpc_method: str, tool_name: str | None) -> bool:
+        return True
+
+    # Back-compat aliases.
+    def authenticate(self, headers: dict[str, str], peer: Any) -> MCPPrincipal | None:
+        return self.authenticate_request(method="", path="", headers=headers, peer=str(peer) if peer is not None else None)
+
+    def authorize(self, principal: MCPPrincipal | None, method: str, params: dict[str, Any]) -> bool:
+        return self.authorize_request(principal, rpc_method=method, tool_name=(params.get("name") if isinstance(params, dict) else None))
+
+    def _with_request_context(self, *, transport: str | None, request_id: str | int | None, principal: str | None, peer: str | None, headers: dict[str, str], version: str | None, session_id: str | None = None):
+        return set_request_context(MCPRequestContext(transport=transport, request_id=request_id, protocol_version=version, session_id=session_id, principal=principal, peer=peer, headers=headers))
+
+    def process_request(
+        self, input_data: str, *, context: MCPRequestContext | None = None
+    ) -> dict[str, Any] | None:
+        """Process a JSON-RPC 2.0 request within an isolated request context."""
         try:
             request = loads(input_data)
         except JSONDecodeError as e:
@@ -1126,33 +1156,49 @@ class MCPServer:
             error = self.create_error(-32600, "Invalid Request: Not a JSON-RPC 2.0 request")
             return self.create_response(request_id, None, error)
 
-        if method == "initialize":
-            return self.handle_initialize(request_id, params)
-        elif method == "tools/list":
-            return self.handle_tools_list(request_id)
-        elif method == "tools/call":
-            return self.handle_tools_call(request_id, params)
-        elif method == "prompts/list":
-            result = self.discover_prompts()
-            return self.create_response(request_id, result, None)
-        elif method == "prompts/get":
-            return self.handle_prompt_get(request_id, params)
-        elif method == "resources/list":
-            return self.handle_resources_list(request_id, params)
-        elif method == "resources/templates/list":
-            return self.handle_resources_templates_list(request_id, params)
-        elif method == "resources/read":
-            return self.handle_resources_read(request_id, params)
-        elif method == "resources/subscribe":
-            return self.handle_resources_subscribe(request_id, params)
-        elif method == "resources/unsubscribe":
-            return self.handle_resources_unsubscribe(request_id, params)
-        elif method == "notifications/initialized":
-            self.logger.info("Host confirmed toolContract reception with 'notifications/initialized'")
-            return None
+        if context is None:
+            context = MCPRequestContext(request_id=request_id)
         else:
-            error = self.create_error(-32601, f"Method not found: {method}")
-            return self.create_response(request_id, None, error)
+            context = MCPRequestContext(
+                transport=context.transport,
+                request_id=request_id,
+                protocol_version=context.protocol_version,
+                session_id=context.session_id,
+                principal=context.principal,
+                peer=context.peer,
+                headers=context.headers,
+            )
+        token = set_request_context(context)
+        try:
+            if method == "initialize":
+                return self.handle_initialize(request_id, params)
+            elif method == "tools/list":
+                return self.handle_tools_list(request_id)
+            elif method == "tools/call":
+                return self.handle_tools_call(request_id, params)
+            elif method == "prompts/list":
+                result = self.discover_prompts()
+                return self.create_response(request_id, result, None)
+            elif method == "prompts/get":
+                return self.handle_prompt_get(request_id, params)
+            elif method == "resources/list":
+                return self.handle_resources_list(request_id, params)
+            elif method == "resources/templates/list":
+                return self.handle_resources_templates_list(request_id, params)
+            elif method == "resources/read":
+                return self.handle_resources_read(request_id, params)
+            elif method == "resources/subscribe":
+                return self.handle_resources_subscribe(request_id, params)
+            elif method == "resources/unsubscribe":
+                return self.handle_resources_unsubscribe(request_id, params)
+            elif method == "notifications/initialized":
+                self.logger.info("Host confirmed toolContract reception with 'notifications/initialized'")
+                return None
+            else:
+                error = self.create_error(-32601, f"Method not found: {method}")
+                return self.create_response(request_id, None, error)
+        finally:
+            reset_request_context(token)
 
     # ==== TCP transport ====
 
@@ -1201,6 +1247,112 @@ class MCPServer:
                 srv.serve_forever()
             except KeyboardInterrupt:
                 self.logger.info("MCP Socket Server stopped.")
+
+    # ==== Streamable HTTP transport ====
+
+    def run_streamable_http(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        endpoint: str = "/mcp",
+        allowed_origins: list[str] | None = None,
+        max_request_bytes: int = 4 * 1024 * 1024,
+    ) -> None:
+        server_self = self
+        allowed_origins = allowed_origins or []
+
+        class _Handler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                server_self.logger.debug("HTTP %s - " + format, self.address_string(), *args)
+
+            def _allowed_origin(self) -> str | None:
+                origin = self.headers.get("Origin")
+                if not origin:
+                    return None
+                if origin in allowed_origins:
+                    return origin
+                if host in ("127.0.0.1", "localhost", "::1") and origin.startswith("http://127.0.0.1"):
+                    return origin
+                return None
+
+            def _json(self, payload: dict[str, Any], status: int = 200) -> None:
+                body = dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+
+            def _rpc_ctx(self, request_id: str | int | None, version: str | None, principal: MCPPrincipal | None):
+                return server_self._with_request_context(transport="streamable-http", request_id=request_id, principal=(principal.name if principal else None), peer=self.client_address[0] if self.client_address else None, headers={k.lower(): v for k, v in self.headers.items()}, version=version)
+
+            def do_OPTIONS(self) -> None:  # noqa: N802
+                origin = self._allowed_origin()
+                if self.headers.get("Origin") and not origin:
+                    self.send_error(403 if host not in ("127.0.0.1", "localhost", "::1") else 405)
+                    return
+                self.send_response(204)
+                if origin:
+                    self.send_header("Access-Control-Allow-Origin", origin)
+                self.end_headers()
+
+            def do_GET(self) -> None: self.send_error(405)
+            def do_DELETE(self) -> None: self.send_error(405)
+
+            def do_POST(self) -> None:  # noqa: N802
+                if self.path != endpoint:
+                    self.send_error(405); self.send_header("Allow", "POST, OPTIONS"); return
+                if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json": self.send_error(415); return
+                acc = self.headers.get("Accept", "*/*")
+                if "application/json" not in acc and "*/*" not in acc: self.send_error(406); return
+                cl = self.headers.get("Content-Length")
+                try:
+                    n = int(cl) if cl is not None else 0
+                except ValueError:
+                    self.send_error(400); return
+                if n > max_request_bytes: self.send_error(413); return
+                body = self.rfile.read(n)
+                origin = self._allowed_origin()
+                if self.headers.get("Origin") and not origin:
+                    self.send_error(403); return
+                principal = server_self.authenticate_request(method="POST", path=self.path, headers={k.lower(): v for k, v in self.headers.items()}, peer=self.client_address[0] if self.client_address else None)
+                if principal is None:
+                    self.send_response(401); self.send_header("WWW-Authenticate", "Bearer"); self.end_headers(); return
+                try:
+                    req = loads(body.decode("utf-8"))
+                except JSONDecodeError:
+                    self._json({"jsonrpc":"2.0","error":server_self.create_error(-32700, "Parse error"),"id":None}); return
+                version = self.headers.get("MCP-Protocol-Version")
+                if req.get("method") != "initialize" and version not in SUPPORTED_PROTOCOL_VERSIONS:
+                    self.send_error(400); return
+                if not isinstance(req, dict):
+                    self._json(server_self.create_response(None, None, server_self.create_error(-32600, "Invalid Request")))
+                    return
+                rpc_method = req.get("method")
+                params = req.get("params") if isinstance(req.get("params"), dict) else {}
+                tool_name = params.get("name") if rpc_method == "tools/call" else None
+                if not server_self.authorize_request(
+                    principal, rpc_method=rpc_method, tool_name=tool_name
+                ):
+                    self.send_error(403)
+                    return
+                context = MCPRequestContext(
+                    transport="streamable-http",
+                    request_id=req.get("id"),
+                    protocol_version=version,
+                    session_id=None,
+                    principal=principal.name if principal else None,
+                    peer=self.client_address[0] if self.client_address else None,
+                    headers={k.lower(): v for k, v in self.headers.items()},
+                )
+                response = server_self.process_request(dumps(req), context=context)
+                if response is None:
+                    self.send_response(202); self.send_header("Content-Length", "0"); self.end_headers(); return
+                self._json(response)
+
+        httpd = ThreadingHTTPServer((host, port), _Handler); httpd.daemon_threads = True
+        actual_host, actual_port = httpd.server_address[:2]
+        print(f"MCP Streamable HTTP Server listening on http://{actual_host}:{actual_port}{endpoint}", flush=True)
+        httpd.serve_forever()
 
     # ==== SSE (Server-Sent Events) HTTP transport ====
 
@@ -1349,31 +1501,42 @@ class MCPServer:
         if args is None:
             args = argv[1:]
 
-        # ---- Parse --port / --host / --tcp flags ----
+        # ---- Parse CLI flags ----
         port: int | None = None
         host: str = "127.0.0.1"
         use_tcp: bool = False
+        transport: str | None = None
+        endpoint = "/mcp"
+        max_request_bytes = 4 * 1024 * 1024
+        allowed_origins: list[str] = []
         remaining: list[str] = []
         i = 0
         while i < len(args):
             if args[i] in ("--port", "-p") and i + 1 < len(args):
-                port = int(args[i + 1])
-                i += 2
+                port = int(args[i + 1]); i += 2
             elif args[i] == "--host" and i + 1 < len(args):
-                host = args[i + 1]
-                i += 2
+                host = args[i + 1]; i += 2
+            elif args[i] == "--endpoint" and i + 1 < len(args):
+                endpoint = args[i + 1]; i += 2
+            elif args[i] == "--max-request-bytes" and i + 1 < len(args):
+                max_request_bytes = int(args[i + 1]); i += 2
+            elif args[i] == "--allowed-origin" and i + 1 < len(args):
+                allowed_origins.append(args[i + 1]); i += 2
+            elif args[i] in ("--transport",) and i + 1 < len(args):
+                transport = args[i + 1]; i += 2
             elif args[i] == "--tcp":
-                use_tcp = True
-                i += 1
+                use_tcp = True; transport = "tcp"; i += 1
+            elif args[i] in ("--http", "--sse"):
+                transport = "streamable-http" if args[i] == "--http" else "sse"; i += 1
             else:
                 remaining.append(args[i])
                 i += 1
 
         if port is not None:
-            if use_tcp:
-                self.run_socket(host=host, port=port)
-            else:
-                self.run_sse(host=host, port=port)
+            mode = transport or ("tcp" if use_tcp else "sse")
+            if mode == "tcp": self.run_socket(host=host, port=port)
+            elif mode == "streamable-http": self.run_streamable_http(host=host, port=port, endpoint=endpoint, allowed_origins=allowed_origins, max_request_bytes=max_request_bytes)
+            else: self.run_sse(host=host, port=port)
             return
 
         # ---- Original stdio / file transport ----

@@ -5,7 +5,7 @@ Protocol][mcp] in Python. The whole library is two files -- `umcp.py`
 for synchronous servers, `aioumcp.py` for asynchronous ones -- and the
 shape of both is the same: a base class that introspects subclass
 methods, generates JSON Schema from their type hints, and serves a
-JSON-RPC 2.0 protocol over one of three transports.
+JSON-RPC 2.0 protocol over stdio, Streamable HTTP, legacy SSE, or TCP.
 
 This document covers what's in there and why. For chaining patterns and
 recommendations for how MCP servers should *behave* once they're built,
@@ -57,7 +57,7 @@ the base that matches the dominant I/O shape.
 
 ## Transports
 
-Both implementations support three transports, selectable on the
+Both implementations support four transports, selectable on the
 command line. The protocol payload is identical across them; only the
 framing differs.
 
@@ -70,7 +70,25 @@ explicitly switches stdin/stdout/stderr to binary mode and disables
 buffering before any I/O happens, because the default text-mode CRLF
 translation on Windows will corrupt JSON-RPC framing in subtle ways.
 
-**SSE** (`--port N`). HTTP server bound to `127.0.0.1:N` implementing
+**Streamable HTTP** (`--port N --http`, or `--transport streamable-http`).
+A stateless `POST /mcp` accepts one JSON-RPC message and returns either a
+JSON response (`200`) or an empty notification acknowledgement (`202`).
+`GET` and `DELETE` return `405` because this first implementation has no
+stateful sessions or server-initiated stream. Non-initialize requests must
+carry a supported `MCP-Protocol-Version`. The transport validates media
+types, response negotiation, Origins, authentication/authorization hooks,
+and a 4 MiB default body limit. It binds to loopback unless `--host` is
+explicitly supplied. Remote deployments should override
+`authenticate_request()` and `authorize_request()` or put the service behind
+a trusted authenticating reverse proxy. Session IDs, if added later, are
+routing identifiers rather than credentials.
+
+Request metadata is exposed safely through `get_request_context()`, backed
+by `contextvars`, so concurrent threads and asyncio tasks cannot overwrite
+one another. The context includes transport, JSON-RPC ID, negotiated version,
+principal name, peer and immutable request headers.
+
+**Legacy SSE** (`--port N`, or `--transport sse`). HTTP server bound to `127.0.0.1:N` implementing
 the MCP Server-Sent Events transport: `GET /sse` opens the event
 stream and emits an `endpoint` event with the per-session POST URL;
 `POST /message?session_id=...` accepts JSON-RPC requests for that

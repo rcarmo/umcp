@@ -41,7 +41,7 @@ handful of runnable examples in [`examples/`](examples/).
 
 ## 📋 Features
 
-- ✅ Full JSON-RPC 2.0 protocol over stdio, SSE, or TCP
+- ✅ Full JSON-RPC 2.0 protocol over stdio, SSE, streamable HTTP, or TCP
 - ✅ Complete MCP protocol implementation (tools, prompts, **resources**, annotations)
 - ✅ Dynamic discovery via function naming convention (`tool_*`, `prompt_*`, `resource_*`, `resource_template_*`)
 - ✅ Complete introspection of function signatures, including `Literal`, `Union`, and `TypedDict`
@@ -356,7 +356,7 @@ Base class for synchronous MCP servers.
 * `handle_prompt_get()` -- dispatches a prompt fetch.
 * `get_config()` -- override to declare server name, version, capabilities.
 * `get_instructions()` -- override to give the model session-level guidance.
-* `run()` -- start the server on the configured transport (stdio by default; pass `--port N` for SSE, add `--tcp` for raw TCP).
+* `run()` -- start the server on the configured transport (stdio by default; pass `--port N` for SSE, `--http` for streamable HTTP, add `--tcp` for raw TCP).
 
 #### `AsyncMCPServer` (`aioumcp.py`)
 
