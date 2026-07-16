@@ -137,6 +137,46 @@ class AuthAsync(AsyncMCPServer):
         return "nope"
 
 
+class LegacyAuthSync(MCPServer):
+    def authenticate(self, headers: dict[str, str], peer: object):
+        if headers.get("authorization") == "Bearer old":
+            return MCPPrincipal(name="legacy")
+        return None
+
+    def authorize(self, principal: MCPPrincipal | None, method: str | None, params: dict[str, object]) -> bool:
+        return params.get("name") != "forbidden"
+
+
+class NewAuthSync(MCPServer):
+    def authenticate_request(self, *, method: str, path: str, headers: dict[str, str], peer: str | None):
+        if headers.get("authorization") == "Bearer new":
+            return MCPPrincipal(name="new")
+        return None
+
+    def authorize_request(self, principal: MCPPrincipal | None, *, rpc_method: str | None, tool_name: str | None) -> bool:
+        return rpc_method == "initialize" or tool_name != "forbidden"
+
+
+class LegacyAuthAsync(AsyncMCPServer):
+    def authenticate(self, headers: dict[str, str], peer: object):
+        if headers.get("authorization") == "Bearer old":
+            return MCPPrincipal(name="legacy")
+        return None
+
+    def authorize(self, principal: MCPPrincipal | None, method: str | None, params: dict[str, object]) -> bool:
+        return params.get("name") != "forbidden"
+
+
+class NewAuthAsync(AsyncMCPServer):
+    async def authenticate_request(self, *, method: str, path: str, headers: dict[str, str], peer: str | None):
+        if headers.get("authorization") == "Bearer new":
+            return MCPPrincipal(name="new")
+        return None
+
+    async def authorize_request(self, principal: MCPPrincipal | None, *, rpc_method: str | None, tool_name: str | None) -> bool:
+        return rpc_method == "initialize" or tool_name != "forbidden"
+
+
 async def _run_async(server: AsyncMCPServer, request: str, body: bytes = b"", max_request_bytes: int = 1024):
     writer = Writer([])
     await server._handle_streamable_http_client(Reader(request, body), writer, "/mcp", ["http://allowed"], max_request_bytes)
@@ -305,6 +345,33 @@ def test_async_http_rejects_bad_content_length_and_oversize() -> None:
     assert any(b"413 Payload Too Large" in chunk for chunk in big.chunks)
 
 
+def test_sync_auth_hook_aliases_and_new_hooks_are_bidirectional() -> None:
+    legacy = LegacyAuthSync()
+    assert legacy.authenticate_request(method="POST", path="/mcp", headers={"authorization": "Bearer old"}, peer="127.0.0.1").name == "legacy"
+    assert legacy.authorize_request(MCPPrincipal(name="legacy"), rpc_method="tools/call", tool_name="ok") is True
+    assert legacy.authorize_request(MCPPrincipal(name="legacy"), rpc_method="tools/call", tool_name="forbidden") is False
+
+    new = NewAuthSync()
+    assert new.authenticate({"authorization": "Bearer new"}, ("127.0.0.1", 1)).name == "new"
+    assert new.authorize(MCPPrincipal(name="new"), "tools/call", {"name": "ok"}) is True
+    assert new.authorize(MCPPrincipal(name="new"), "tools/call", {"name": "forbidden"}) is False
+
+
+def test_async_auth_hook_aliases_and_new_hooks_are_bidirectional() -> None:
+    legacy = LegacyAuthAsync()
+    principal = asyncio.run(legacy.authenticate_request_async(method="POST", path="/mcp", headers={"authorization": "Bearer old"}, peer="127.0.0.1"))
+    assert principal.name == "legacy"
+    assert asyncio.run(legacy.authorize_request_async(MCPPrincipal(name="legacy"), rpc_method="tools/call", tool_name="ok")) is True
+    assert asyncio.run(legacy.authorize_request_async(MCPPrincipal(name="legacy"), rpc_method="tools/call", tool_name="forbidden")) is False
+    assert asyncio.run(legacy.authenticate_async({"authorization": "Bearer old"}, ("127.0.0.1", 1))).name == "legacy"
+    assert asyncio.run(legacy.authorize_async(MCPPrincipal(name="legacy"), "tools/call", {"name": "ok"})) is True
+
+    new = NewAuthAsync()
+    assert asyncio.run(new.authenticate_async({"authorization": "Bearer new"}, ("127.0.0.1", 1))).name == "new"
+    assert asyncio.run(new.authorize_async(MCPPrincipal(name="new"), "tools/call", {"name": "ok"})) is True
+    assert asyncio.run(new.authorize_async(MCPPrincipal(name="new"), "tools/call", {"name": "forbidden"})) is False
+
+
 def test_async_http_rejects_missing_version_bad_accept_and_unauthorized() -> None:
     s = AuthAsync()
     body = dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
@@ -328,6 +395,94 @@ def test_async_http_preflight_requires_valid_origin_and_authorization_can_forbid
     req = f"POST /mcp HTTP/1.1\nContent-Type: application/json\nAccept: application/json\nAuthorization: Bearer ok\nMCP-Protocol-Version: 2025-03-26\nContent-Length: {len(body)}"
     denied = asyncio.run(_run_async(s, req, body))
     assert b"403 Forbidden" in b"".join(denied.chunks)
+
+
+@pytest.mark.parametrize(
+    ("raw_request", "body", "status"),
+    [
+        ("GET /mcp HTTP/1.1\nOrigin: http://allowed\nContent-Length: 0", b"", b"405 Method Not Allowed"),
+        ("POST /mcp HTTP/1.1\nOrigin: http://allowed\nContent-Type: text/plain\nAccept: application/json\nAuthorization: Bearer ok\nContent-Length: 0", b"", b"415 Unsupported Media Type"),
+        ("POST /mcp HTTP/1.1\nOrigin: http://allowed\nContent-Type: application/json\nAccept: text/plain\nAuthorization: Bearer ok\nContent-Length: 0", b"", b"406 Not Acceptable"),
+        ("POST /mcp HTTP/1.1\nOrigin: http://allowed\nContent-Type: application/json\nAccept: application/json\nMCP-Protocol-Version: 2025-03-26\nContent-Length: 0", b"", b"401 Unauthorized"),
+        ("POST /mcp HTTP/1.1\nOrigin: http://allowed\nContent-Type: application/json\nAccept: application/json\nAuthorization: Bearer ok\nMCP-Protocol-Version: 2025-03-26\nContent-Length: 0", b"", b"200 OK"),
+        ("POST /mcp HTTP/1.1\nOrigin: http://allowed\nContent-Type: application/json\nAccept: application/json\nAuthorization: Bearer ok\nContent-Length: nope", b"", b"400 Bad Request"),
+        ("POST /mcp HTTP/1.1\nOrigin: http://allowed\nContent-Type: application/json\nAccept: application/json\nAuthorization: Bearer ok\nContent-Length: 9", b"", b"413 Payload Too Large"),
+    ],
+)
+def test_async_http_allowed_origin_gets_cors_on_terminal_responses(raw_request: str, body: bytes, status: bytes) -> None:
+    wire = b"".join(asyncio.run(_run_async(AuthAsync(), raw_request, body, max_request_bytes=8)).chunks)
+    assert status in wire
+    assert b"Access-Control-Allow-Origin: http://allowed" in wire
+    assert b"Vary: Origin" in wire
+
+
+def test_async_http_allowed_origin_gets_cors_on_json_errors_and_duplicate_length_and_transfer_encoding() -> None:
+    s = AuthAsync()
+    bad_json = b"{"
+    parse_request = "\n".join([
+        "POST /mcp HTTP/1.1",
+        "Origin: http://allowed",
+        "Content-Type: application/json",
+        "Accept: application/json",
+        "Authorization: Bearer ok",
+        f"Content-Length: {len(bad_json)}",
+    ])
+    wire = b"".join(asyncio.run(_run_async(s, parse_request, bad_json)).chunks)
+    assert b"200 OK" in wire and b"Access-Control-Allow-Origin: http://allowed" in wire and b"Vary: Origin" in wire
+
+    invalid_request_body = b"[]"
+    invalid_request = "\n".join([
+        "POST /mcp HTTP/1.1",
+        "Origin: http://allowed",
+        "Content-Type: application/json",
+        "Accept: application/json",
+        "Authorization: Bearer ok",
+        f"Content-Length: {len(invalid_request_body)}",
+    ])
+    wire = b"".join(asyncio.run(_run_async(s, invalid_request, invalid_request_body)).chunks)
+    assert b"200 OK" in wire and b"Access-Control-Allow-Origin: http://allowed" in wire and b"Vary: Origin" in wire
+
+    dup_cl = "\n".join([
+        "POST /mcp HTTP/1.1",
+        "Origin: http://allowed",
+        "Content-Type: application/json",
+        "Accept: application/json",
+        "Authorization: Bearer ok",
+        "Content-Length: 0",
+        "Content-Length: 0",
+    ])
+    wire = b"".join(asyncio.run(_run_async(s, dup_cl)).chunks)
+    assert b"400 Bad Request" in wire and b"Access-Control-Allow-Origin: http://allowed" in wire
+
+    transfer_encoding = "\n".join([
+        "POST /mcp HTTP/1.1",
+        "Origin: http://allowed",
+        "Content-Type: application/json",
+        "Accept: application/json",
+        "Authorization: Bearer ok",
+        "Transfer-Encoding: chunked",
+        "Content-Length: 0",
+    ])
+    wire = b"".join(asyncio.run(_run_async(s, transfer_encoding)).chunks)
+    assert b"400 Bad Request" in wire and b"Access-Control-Allow-Origin: http://allowed" in wire
+
+
+def test_origin_validation_rejects_malformed_loopback_forms() -> None:
+    bad_origins = [
+        "http://user@localhost",
+        "http://localhost/",
+        "http://localhost/path",
+        "http://localhost?x=1",
+        "http://localhost#frag",
+        "http://localhost:99999",
+        "http://127.0.0.1.evil.example",
+    ]
+    for origin in bad_origins:
+        assert not origin_is_allowed(origin)
+    assert origin_is_allowed("http://localhost")
+    assert origin_is_allowed("http://localhost:3000")
+    assert not origin_is_allowed("https://ui.example/path", ["https://ui.example/path"], local_bind=False)
+    assert origin_is_allowed("https://ui.example", ["https://ui.example"], local_bind=False)
 
 
 def test_remote_safe_prompt_errors() -> None:

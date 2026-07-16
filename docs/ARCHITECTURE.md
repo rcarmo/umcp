@@ -99,7 +99,7 @@ fact.
 **Legacy SSE** (`--port N`, or `--transport sse`). HTTP server bound to `127.0.0.1:N` implementing
 the MCP Server-Sent Events transport: `GET /sse` opens the event
 stream and emits an `endpoint` event with the per-session POST URL;
-`POST /message?session_id=...` accepts JSON-RPC requests for that
+`POST /message?sessionId=...` accepts JSON-RPC requests for that
 session. Useful when the client lives in a different process from the
 server, when you want multiple clients sharing one server, or when the
 client is a web app that can't spawn subprocesses. Bound to localhost
@@ -127,7 +127,8 @@ For each tool, `discover_tools()` does the following:
 2. Reads the type hints via `inspect.signature` and `get_type_hints`.
 3. Builds a JSON Schema `inputSchema` from the parameters: required
    parameters become required schema keys; defaulted parameters
-   become optional with their default value carried through.
+   become optional. Defaults affect required-vs-optional only; they are
+   not emitted as JSON Schema `default` values.
 4. Sets `additionalProperties: false` on the generated schema so
    unknown arguments are rejected at validation time, not silently
    ignored.
@@ -148,29 +149,28 @@ type. There is no second source of truth.
 The schema generator handles the standard cases:
 
 * Primitives: `str`, `int`, `float`, `bool`, `None`.
-* Containers: `list[T]`, `dict[str, T]`, `tuple[T, ...]`.
+* Containers: `list[T]`, `dict[str, T]`. Tuple annotations are not
+  currently modelled specially and fall back to the generic unknown-type
+  behaviour.
 * Optionals: `T | None` and `Optional[T]` both work; the resulting
   schema marks the parameter as not required and carries the inner
   type. PEP 604 `T | None` syntax is preferred (and is the reason for
   the Python 3.10 minimum -- `types.UnionType` only landed in 3.10).
-* Unions: `str | int` becomes a JSON Schema `type: ["string",
-  "integer"]`. Useful for tools that genuinely accept multiple shapes;
-  best avoided when a single type would do.
+* Unions: `str | int` becomes a JSON Schema `oneOf` with one schema per
+  branch. Useful for tools that genuinely accept multiple shapes; best
+  avoided when a single type would do.
 * `Literal[...]`: becomes a JSON Schema `enum`. This is the trick that
   makes `mode="dry_run" | "best_effort" | "safe" | "strict"` show up
   to the model as a closed set rather than a free-text string.
 * `TypedDict`: becomes a typed object schema with the right
-  `properties`, `required`, and -- in keeping with the rest of the
-  library -- `additionalProperties: false`. `total=False` TypedDicts
-  produce schemas with no `required` keys. This lets you declare
-  structured argument shapes (the office server uses this for
-  `PatchChange`) and have them schema-checked end to end.
-* Default values are carried into the schema, which gives clients
-  something useful to display and gives the model a hint about the
-  expected shape.
+  `properties` and `required` keys derived from the current runtime's
+  `__required_keys__` metadata. `total=False` TypedDicts therefore
+  produce schemas with no `required` keys. The current implementation
+  does not add `additionalProperties: false` inside nested TypedDict
+  schemas.
 
-Anything the generator can't classify falls back to an empty
-`{}` schema, which clients treat as "any". That's a deliberate
+Anything the generator can't classify falls back to `{"type": "string"}`.
+That's a deliberate
 soft-fail -- the alternative would be a hard error at server startup
 for tool authors who use exotic types, and the hard error tends to be
 more annoying than the loose schema.
@@ -181,8 +181,9 @@ The MCP spec defines optional `annotations` on tools that hint at
 behaviour: `readOnlyHint`, `destructiveHint`, `openWorldHint`. `umcp`
 infers these from the tool name so most tool authors get them for free.
 
-Method names starting with `get_`, `list_`, `read_`, `inspect_`,
-`describe_`, `search_`, `find_` are treated as read-only.
+Method names starting with `list_`, `get_`, `read_`, `inspect_`,
+`extract_`, `query_`, `search_`, `check_`, `audit_`, `fetch_`,
+`calculate_`, or `recommend_` are treated as read-only.
 `delete_`, `clear_`, `cleanup_`, `restart_` are treated as
 destructive. `web_*` and `azure_*` are treated as open-world (they
 talk to a network the client can't reason about). The full lists are
@@ -343,12 +344,11 @@ still own credential validation and role policy; a trusted reverse proxy is
 also a sensible boundary. Legacy SSE and TCP bind to localhost and do not
 use the HTTP hooks.
 
-*No concurrency in the synchronous version.* `MCPServer` handles one
-request at a time. Given that MCP over stdio is inherently
-single-request-per-message and the typical sync use case is local
-file/process work where concurrency would just add lock complexity,
-this is the right default. Use `AsyncMCPServer` if you genuinely need
-to overlap I/O.
+*No concurrency for synchronous stdio or file input.* Those modes dispatch
+one message at a time. The synchronous TCP and HTTP transports use the
+standard library's threaded servers, so subclasses serving them must protect
+mutable application state. Use `AsyncMCPServer` when overlapping network I/O
+is the dominant workload.
 
 *No persistent state between calls.* The library doesn't help you
 manage state -- if your tools need shared state, that's instance

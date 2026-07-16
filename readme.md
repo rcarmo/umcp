@@ -506,7 +506,7 @@ python -m pytest tests/test_resources.py -v
 | `test_streamable_http_regressions.py` | auth, Origin, CORS, limits, context isolation, CLI, and remote-safe errors |
 | `simple_async_test.py` | smoke tests for the async base |
 
-The current suite has **163 tests** covering both bases and runs on Python
+The current suite has **176 tests** covering both bases and runs on Python
 3.10, 3.11, and 3.12.
 
 ---

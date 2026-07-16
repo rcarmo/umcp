@@ -175,6 +175,18 @@ def test_sync_streamable_http_round_trip_and_error_paths() -> None:
         )
         assert b"200 OK" in response and b'"tools"' in response
 
+        disallowed_get = _http_request(
+            "127.0.0.1", port,
+            b"GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\n\r\n",
+        )
+        assert b"403 Forbidden" in disallowed_get
+
+        disallowed_path = _http_request(
+            "127.0.0.1", port,
+            b"POST /wrong HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\nContent-Length: 0\r\n\r\n",
+        )
+        assert b"403 Forbidden" in disallowed_path
+
         no_origin = _http_request(
             "127.0.0.1", port,
             b"OPTIONS /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
@@ -244,6 +256,100 @@ def test_sync_streamable_http_auth_401_and_403() -> None:
                 ),
             )
             assert b"403 Forbidden" in forbidden
+        finally:
+            _kill(proc)
+    finally:
+        os.unlink(script.name)
+
+
+def test_sync_streamable_http_legacy_auth_alias_cors_errors_and_length_guards() -> None:
+    script = NamedTemporaryFile("w", suffix=".py", delete=False, dir=str(ROOT))
+    try:
+        script.write(
+            "from umcp import MCPServer\n"
+            "from umcp_shared import MCPPrincipal\n"
+            "class S(MCPServer):\n"
+            "    def authenticate(self, headers, peer):\n"
+            "        return MCPPrincipal(name='legacy') if headers.get('authorization') == 'Bearer ok' else None\n"
+            "    def authorize(self, principal, method, params):\n"
+            "        return params.get('name') != 'forbidden'\n"
+            "    def tool_forbidden(self):\n"
+            "        return 'x'\n"
+            "S().run()\n"
+        )
+        script.flush(); script.close()
+        proc = subprocess.Popen(
+            [sys.executable, script.name, "--port", "0", "--http", "--allowed-origin", "http://allowed"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+            cwd=str(ROOT),
+        )
+        try:
+            port = _wait_for_port(proc.stdout)
+            body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "forbidden"}}).encode("utf-8")
+            requests = [
+                (
+                    b"GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://allowed\r\nContent-Length: 0\r\n\r\n",
+                    b"405 Method Not Allowed",
+                ),
+                (
+                    b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://allowed\r\nContent-Type: text/plain\r\nAccept: application/json\r\nAuthorization: Bearer ok\r\nContent-Length: 0\r\n\r\n",
+                    b"415 Unsupported Media Type",
+                ),
+                (
+                    b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://allowed\r\nContent-Type: application/json\r\nAccept: application/json\r\nMCP-Protocol-Version: 2025-03-26\r\nContent-Length: 0\r\n\r\n",
+                    b"401 Unauthorized",
+                ),
+                (
+                    b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://allowed\r\nContent-Type: application/json\r\nAccept: application/json\r\nAuthorization: Bearer ok\r\nMCP-Protocol-Version: 2025-03-26\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+                    b"400 Bad Request",
+                ),
+                (
+                    b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://allowed\r\nContent-Type: application/json\r\nAccept: application/json\r\nAuthorization: Bearer ok\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
+                    b"400 Bad Request",
+                ),
+                (
+                    b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://allowed\r\nContent-Type: application/json\r\nAccept: application/json\r\nAuthorization: Bearer ok\r\nMCP-Protocol-Version: 2025-03-26\r\n"
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body,
+                    b"403 Forbidden",
+                ),
+            ]
+            for request, status in requests:
+                response = _http_request("127.0.0.1", port, request)
+                assert status in response
+                assert b"Access-Control-Allow-Origin: http://allowed" in response
+                assert b"Vary: Origin" in response
+        finally:
+            _kill(proc)
+    finally:
+        os.unlink(script.name)
+
+
+def test_sync_streamable_http_rejects_async_auth_hooks_cleanly() -> None:
+    script = NamedTemporaryFile("w", suffix=".py", delete=False, dir=str(ROOT))
+    try:
+        script.write(
+            "from umcp import MCPServer\n"
+            "class S(MCPServer):\n"
+            "    async def authenticate_request(self, *, method, path, headers, peer):\n"
+            "        return None\n"
+            "S().run()\n"
+        )
+        script.flush(); script.close()
+        proc = subprocess.Popen(
+            [sys.executable, script.name, "--port", "0", "--http"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1, cwd=str(ROOT),
+        )
+        try:
+            port = _wait_for_port(proc.stdout)
+            body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).encode()
+            response = _http_request(
+                "127.0.0.1", port,
+                b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode() + body,
+            )
+            assert b"500 Internal Server Error" in response
+            assert proc.poll() is None
         finally:
             _kill(proc)
     finally:

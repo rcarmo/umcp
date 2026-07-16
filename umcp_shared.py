@@ -95,11 +95,19 @@ def origin_is_allowed(
     """Validate an Origin exactly; loopback origins are implicit only locally."""
     if not origin:
         return False
+    parsed = urlparse(origin)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    if parsed.path or parsed.params or parsed.query or parsed.fragment:
+        return False
+    try:
+        parsed.port
+    except ValueError:
+        return False
     if origin in allowed_origins:
         return True
     if not local_bind:
-        return False
-    parsed = urlparse(origin)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return False
     return parsed.hostname.lower() in {"127.0.0.1", "localhost", "::1"}

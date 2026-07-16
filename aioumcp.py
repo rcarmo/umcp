@@ -59,6 +59,7 @@ from inspect import (
     Signature,
     getdoc,
     getmembers,
+    isawaitable,
     iscoroutinefunction,
     ismethod,
     signature,
@@ -1157,10 +1158,46 @@ class AsyncMCPServer:
         return detailed_message
 
     def authenticate_request(self, *, method: str, path: str, headers: Mapping[str, str], peer: str | None) -> MCPPrincipal | None:
+        legacy = type(self).authenticate
+        if legacy is not AsyncMCPServer.authenticate:
+            return legacy(self, headers, peer)
         return MCPPrincipal(name="anonymous")
 
     def authorize_request(self, principal: MCPPrincipal | None, *, rpc_method: str | None, tool_name: str | None) -> bool:
+        legacy = type(self).authorize
+        if legacy is not AsyncMCPServer.authorize:
+            params: Mapping[str, Any] = {"name": tool_name} if tool_name is not None else {}
+            return legacy(self, principal, rpc_method, params)
         return True
+
+    # Back-compat aliases.
+    def authenticate(self, headers: Mapping[str, str], peer: Any) -> MCPPrincipal | None:
+        request_hook = type(self).authenticate_request
+        if request_hook is not AsyncMCPServer.authenticate_request:
+            return request_hook(self, method="", path="", headers=headers, peer=str(peer) if peer is not None else None)
+        return MCPPrincipal(name="anonymous")
+
+    def authorize(self, principal: MCPPrincipal | None, method: str | None, params: Mapping[str, Any]) -> bool:
+        request_hook = type(self).authorize_request
+        if request_hook is not AsyncMCPServer.authorize_request:
+            return request_hook(self, principal, rpc_method=method, tool_name=(params.get("name") if isinstance(params, Mapping) else None))
+        return True
+
+    async def authenticate_request_async(self, *, method: str, path: str, headers: Mapping[str, str], peer: str | None) -> MCPPrincipal | None:
+        result = self.authenticate_request(method=method, path=path, headers=headers, peer=peer)
+        return await result if isawaitable(result) else result
+
+    async def authorize_request_async(self, principal: MCPPrincipal | None, *, rpc_method: str | None, tool_name: str | None) -> bool:
+        result = self.authorize_request(principal, rpc_method=rpc_method, tool_name=tool_name)
+        return await result if isawaitable(result) else result
+
+    async def authenticate_async(self, headers: Mapping[str, str], peer: Any) -> MCPPrincipal | None:
+        result = self.authenticate(headers, peer)
+        return await result if isawaitable(result) else result
+
+    async def authorize_async(self, principal: MCPPrincipal | None, method: str | None, params: Mapping[str, Any]) -> bool:
+        result = self.authorize(principal, method, params)
+        return await result if isawaitable(result) else result
 
     def _with_request_context(self, *, transport: str | None, request_id: str | int | None, principal: str | None, peer: str | None, headers: dict[str, str], version: str | None, session_id: str | None = None):
         return set_request_context(MCPRequestContext(transport=transport, request_id=request_id, protocol_version=version, session_id=session_id, principal=principal, peer=peer, headers=headers))
@@ -1483,7 +1520,7 @@ class AsyncMCPServer:
         max_request_bytes: int = 4 * 1024 * 1024,
     ) -> None:
         allowed_origins = allowed_origins or []
-        if host not in ("127.0.0.1", "localhost", "::1") and type(self).authenticate_request is AsyncMCPServer.authenticate_request:
+        if host not in ("127.0.0.1", "localhost", "::1") and type(self).authenticate_request is AsyncMCPServer.authenticate_request and type(self).authenticate is AsyncMCPServer.authenticate:
             self.logger.warning("Streamable HTTP is bound beyond loopback without an authentication hook")
         server = await start_server(
             lambda r, w: self._handle_streamable_http_client(
@@ -1504,86 +1541,119 @@ class AsyncMCPServer:
         host: str = "127.0.0.1",
     ) -> None:
         peer = writer.get_extra_info('peername')
+
+        async def send_response(status: str, *, body: bytes = b'', content_type: str | None = None, allow: str | None = None, www_authenticate: str | None = None, origin: str | None = None, extra_headers: tuple[tuple[str, str], ...] = ()) -> None:
+            response = [f'HTTP/1.1 {status}\r\n'.encode()]
+            if content_type:
+                response.append(f'Content-Type: {content_type}\r\n'.encode())
+            if allow:
+                response.append(f'Allow: {allow}\r\n'.encode())
+            if www_authenticate:
+                response.append(f'WWW-Authenticate: {www_authenticate}\r\n'.encode())
+            if origin:
+                response.append(f'Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n'.encode())
+            for key, value in extra_headers:
+                response.append(f'{key}: {value}\r\n'.encode())
+            response.append(f'Content-Length: {len(body)}\r\n\r\n'.encode())
+            if body:
+                response.append(body)
+            writer.write(b''.join(response))
+            await writer.drain()
+
         try:
             try:
                 line = await wait_for(reader.readline(), timeout=30.0)
                 if not line or len(line) > 8192:
-                    raise ValueError("invalid request line")
+                    raise ValueError('invalid request line')
                 parts = line.decode('ascii', errors='strict').strip().split(' ')
                 if len(parts) != 3:
-                    raise ValueError("invalid request line")
+                    raise ValueError('invalid request line')
                 method, path, _ = parts
                 headers: dict[str, str] = {}
+                header_counts: dict[str, int] = {}
                 header_bytes = 0
                 for _ in range(100):
                     h = await wait_for(reader.readline(), timeout=30.0)
                     header_bytes += len(h)
                     if header_bytes > 65536:
-                        raise ValueError("headers too large")
+                        raise ValueError('headers too large')
                     if h in (b'\r\n', b'\n'):
                         break
                     if not h or b':' not in h:
-                        raise ValueError("invalid header")
+                        raise ValueError('invalid header')
                     k, v = h.decode('iso-8859-1').split(':', 1)
-                    headers[k.strip().lower()] = v.strip()
+                    key = k.strip().lower()
+                    headers[key] = v.strip()
+                    header_counts[key] = header_counts.get(key, 0) + 1
                 else:
-                    raise ValueError("too many headers")
+                    raise ValueError('too many headers')
             except (ValueError, UnicodeError, TimeoutError):
-                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+                await send_response('400 Bad Request'); return
+            origin = headers.get('origin')
+            allowed_origin = origin if origin and origin_is_allowed(
+                origin, allowed_origins,
+                local_bind=host in ('127.0.0.1', 'localhost', '::1'),
+            ) else None
+            if origin and not allowed_origin:
+                await send_response('403 Forbidden'); return
+            if header_counts.get('transfer-encoding', 0):
+                await send_response('400 Bad Request', origin=allowed_origin); return
+            if header_counts.get('content-length', 0) > 1:
+                await send_response('400 Bad Request', origin=allowed_origin); return
             try:
-                n=int(headers.get('content-length','0') or '0')
+                n = int(headers.get('content-length', '0') or '0')
             except ValueError:
-                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+                await send_response('400 Bad Request', origin=allowed_origin); return
             if n < 0:
-                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
-            if n>max_request_bytes:
-                writer.write(b'HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+                await send_response('400 Bad Request', origin=allowed_origin); return
+            if n > max_request_bytes:
+                await send_response('413 Payload Too Large', origin=allowed_origin); return
             try:
                 body = await wait_for(reader.readexactly(n), timeout=30.0) if n else b''
             except (TimeoutError, IncompleteReadError):
-                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
-            origin=headers.get('origin')
-            if origin and not origin_is_allowed(
-                origin, allowed_origins,
-                local_bind=host in ('127.0.0.1', 'localhost', '::1'),
-            ):
-                writer.write(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
-            cors = (f'Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n'.encode() if origin else b'')
+                await send_response('400 Bad Request', origin=allowed_origin); return
             if method == 'OPTIONS':
                 if not origin:
-                    writer.write(b'HTTP/1.1 405 Method Not Allowed\r\nAllow: POST, OPTIONS\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
-                writer.write(b'HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n' + cors + b'Access-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, MCP-Protocol-Version, Authorization\r\n\r\n'); await writer.drain(); return
+                    await send_response('405 Method Not Allowed', allow='POST, OPTIONS'); return
+                await send_response(
+                    '204 No Content',
+                    origin=allowed_origin,
+                    extra_headers=(
+                        ('Access-Control-Allow-Methods', 'POST, OPTIONS'),
+                        ('Access-Control-Allow-Headers', 'Content-Type, Accept, MCP-Protocol-Version, Authorization'),
+                    ),
+                )
+                return
             if method != 'POST' or path != endpoint:
-                writer.write(b'HTTP/1.1 405 Method Not Allowed\r\nAllow: POST, OPTIONS\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+                await send_response('405 Method Not Allowed', allow='POST, OPTIONS', origin=allowed_origin); return
             if not content_type_is_json(headers.get('content-type')):
-                writer.write(b'HTTP/1.1 415 Unsupported Media Type\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+                await send_response('415 Unsupported Media Type', origin=allowed_origin); return
             if not media_accepts_json(headers.get('accept')):
-                writer.write(b'HTTP/1.1 406 Not Acceptable\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
-            principal = self.authenticate_request(method='POST', path=path, headers=headers, peer=peer[0] if peer else None)
+                await send_response('406 Not Acceptable', origin=allowed_origin); return
+            principal = await self.authenticate_request_async(method='POST', path=path, headers=headers, peer=peer[0] if peer else None)
             if principal is None:
-                writer.write(b'HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+                await send_response('401 Unauthorized', www_authenticate='Bearer', origin=allowed_origin); return
             try:
                 req = loads(body.decode('utf-8'))
             except JSONDecodeError:
-                resp = self.create_response(None, None, self.create_error(-32700,'Parse error'))
-                data=(dumps(resp)+'\n').encode(); writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n\r\n'.encode()+data); await writer.drain(); return
+                resp = self.create_response(None, None, self.create_error(-32700, 'Parse error'))
+                await send_response('200 OK', body=(dumps(resp) + '\n').encode(), content_type='application/json', origin=allowed_origin); return
             if not isinstance(req, dict):
                 resp = self.create_response(None, None, self.create_error(-32600, 'Invalid Request'))
-                data = dumps(resp).encode()
-                writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n\r\n'.encode() + data)
-                await writer.drain(); return
+                await send_response('200 OK', body=dumps(resp).encode(), content_type='application/json', origin=allowed_origin)
+                return
             rpc_method = req.get('method')
             version = headers.get('mcp-protocol-version')
             if rpc_method != 'initialize' and version not in SUPPORTED_PROTOCOL_VERSIONS:
-                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+                await send_response('400 Bad Request', origin=allowed_origin); return
             is_response = rpc_method is None and ('result' in req or 'error' in req)
             is_notification = rpc_method is not None and 'id' not in req
             if is_response:
-                writer.write(b'HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n' + cors + b'\r\n'); await writer.drain(); return
+                await send_response('202 Accepted', origin=allowed_origin); return
             params = req.get('params') if isinstance(req.get('params'), dict) else {}
             tool_name = params.get('name') if rpc_method == 'tools/call' else None
-            if not self.authorize_request(principal, rpc_method=rpc_method, tool_name=tool_name):
-                writer.write(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+            if not await self.authorize_request_async(principal, rpc_method=rpc_method, tool_name=tool_name):
+                await send_response('403 Forbidden', origin=allowed_origin); return
             context = MCPRequestContext(
                 transport='streamable-http', request_id=req.get('id'),
                 protocol_version=version, session_id=None,
@@ -1594,8 +1664,8 @@ class AsyncMCPServer:
             if is_notification:
                 response = None
             if response is None:
-                writer.write(b'HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n' + cors + b'\r\n'); await writer.drain(); return
-            data=(dumps(response)+'\n').encode(); writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n'.encode() + cors + b'\r\n' + data); await writer.drain()
+                await send_response('202 Accepted', origin=allowed_origin); return
+            await send_response('200 OK', body=(dumps(response) + '\n').encode(), content_type='application/json', origin=allowed_origin)
         finally:
             writer.close()
 

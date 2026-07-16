@@ -52,6 +52,7 @@ from inspect import (
     Signature,
     getdoc,
     getmembers,
+    isawaitable,
     ismethod,
     signature,
 )
@@ -1135,17 +1136,30 @@ class MCPServer:
         return detailed_message
 
     def authenticate_request(self, *, method: str, path: str, headers: Mapping[str, str], peer: str | None) -> MCPPrincipal | None:
+        legacy = type(self).authenticate
+        if legacy is not MCPServer.authenticate:
+            return legacy(self, headers, peer)
         return MCPPrincipal(name="anonymous")
 
     def authorize_request(self, principal: MCPPrincipal | None, *, rpc_method: str | None, tool_name: str | None) -> bool:
+        legacy = type(self).authorize
+        if legacy is not MCPServer.authorize:
+            params: Mapping[str, Any] = {"name": tool_name} if tool_name is not None else {}
+            return legacy(self, principal, rpc_method, params)
         return True
 
     # Back-compat aliases.
     def authenticate(self, headers: Mapping[str, str], peer: Any) -> MCPPrincipal | None:
-        return self.authenticate_request(method="", path="", headers=headers, peer=str(peer) if peer is not None else None)
+        request_hook = type(self).authenticate_request
+        if request_hook is not MCPServer.authenticate_request:
+            return request_hook(self, method="", path="", headers=headers, peer=str(peer) if peer is not None else None)
+        return MCPPrincipal(name="anonymous")
 
     def authorize(self, principal: MCPPrincipal | None, method: str | None, params: Mapping[str, Any]) -> bool:
-        return self.authorize_request(principal, rpc_method=method, tool_name=(params.get("name") if isinstance(params, Mapping) else None))
+        request_hook = type(self).authorize_request
+        if request_hook is not MCPServer.authorize_request:
+            return request_hook(self, principal, rpc_method=method, tool_name=(params.get("name") if isinstance(params, Mapping) else None))
+        return True
 
     def _with_request_context(self, *, transport: str | None, request_id: str | int | None, principal: str | None, peer: str | None, headers: dict[str, str], version: str | None, session_id: str | None = None):
         return set_request_context(MCPRequestContext(transport=transport, request_id=request_id, protocol_version=version, session_id=session_id, principal=principal, peer=peer, headers=headers))
@@ -1317,22 +1331,30 @@ class MCPServer:
                     return origin
                 return None
 
-            def _json(self, payload: dict[str, Any], status: int = 200) -> None:
-                body = dumps(payload).encode("utf-8")
+            def _send_response(self, status: int, *, body: bytes = b"", content_type: str | None = None, allow: str | None = None, www_authenticate: str | None = None, origin: str | None = None) -> None:
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                origin = self._allowed_origin()
+                if content_type:
+                    self.send_header("Content-Type", content_type)
+                if allow:
+                    self.send_header("Allow", allow)
+                if www_authenticate:
+                    self.send_header("WWW-Authenticate", www_authenticate)
                 if origin:
                     self.send_header("Access-Control-Allow-Origin", origin)
                     self.send_header("Vary", "Origin")
                 self.send_header("Content-Length", str(len(body)))
-                self.end_headers(); self.wfile.write(body)
-
-            def _send_method_not_allowed(self, allow: str = "POST, OPTIONS") -> None:
-                self.send_response(405)
-                self.send_header("Allow", allow)
-                self.send_header("Content-Length", "0")
                 self.end_headers()
+                if body:
+                    self.wfile.write(body)
+
+            def _json(self, payload: dict[str, Any], status: int = 200, *, origin: str | None = None) -> None:
+                self._send_response(status, body=dumps(payload).encode("utf-8"), content_type="application/json", origin=origin)
+
+            def _empty(self, status: int, *, allow: str | None = None, www_authenticate: str | None = None, origin: str | None = None) -> None:
+                self._send_response(status, allow=allow, www_authenticate=www_authenticate, origin=origin)
+
+            def _send_method_not_allowed(self, allow: str = "POST, OPTIONS", *, origin: str | None = None) -> None:
+                self._empty(405, allow=allow, origin=origin)
 
             def do_OPTIONS(self) -> None:  # noqa: N802
                 origin_header = self.headers.get("Origin")
@@ -1341,7 +1363,7 @@ class MCPServer:
                     return
                 origin = self._allowed_origin()
                 if not origin:
-                    self.send_error(403)
+                    self._empty(403)
                     return
                 self.send_response(204)
                 self.send_header("Access-Control-Allow-Origin", origin)
@@ -1351,65 +1373,91 @@ class MCPServer:
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
-            def do_GET(self) -> None: self._send_method_not_allowed()
-            def do_DELETE(self) -> None: self._send_method_not_allowed()
+            def _reject_disallowed_origin(self, origin: str | None) -> bool:
+                if self.headers.get("Origin") and not origin:
+                    self._empty(403)
+                    return True
+                return False
+
+            def do_GET(self) -> None:
+                origin = self._allowed_origin()
+                if not self._reject_disallowed_origin(origin):
+                    self._send_method_not_allowed(origin=origin)
+
+            def do_DELETE(self) -> None:
+                origin = self._allowed_origin()
+                if not self._reject_disallowed_origin(origin):
+                    self._send_method_not_allowed(origin=origin)
 
             def do_POST(self) -> None:  # noqa: N802
                 self.connection.settimeout(30.0)
-                if self.path != endpoint:
-                    self._send_method_not_allowed()
+                origin = self._allowed_origin()
+                if self._reject_disallowed_origin(origin):
                     return
+                if self.path != endpoint:
+                    self._send_method_not_allowed(origin=origin)
+                    return
+                if self.headers.get_all("Transfer-Encoding"):
+                    self._empty(400, origin=origin); return
+                content_lengths = self.headers.get_all("Content-Length") or []
+                if len(content_lengths) > 1:
+                    self._empty(400, origin=origin); return
                 if not content_type_is_json(self.headers.get("Content-Type")):
-                    self.send_error(415); return
+                    self._empty(415, origin=origin); return
                 if not media_accepts_json(self.headers.get("Accept")):
-                    self.send_error(406); return
+                    self._empty(406, origin=origin); return
                 cl = self.headers.get("Content-Length")
                 try:
                     n = int(cl) if cl is not None else 0
                 except ValueError:
-                    self.send_error(400); return
+                    self._empty(400, origin=origin); return
                 if n < 0:
-                    self.send_error(400); return
+                    self._empty(400, origin=origin); return
                 if n > max_request_bytes:
-                    self.send_error(413); return
+                    self._empty(413, origin=origin); return
                 try:
                     body = self.rfile.read(n)
                 except TimeoutError:
-                    self.send_error(400)
+                    self._empty(400, origin=origin)
                     return
                 if len(body) != n:
-                    self.send_error(400)
+                    self._empty(400, origin=origin)
                     return
-                origin = self._allowed_origin()
-                if self.headers.get("Origin") and not origin:
-                    self.send_error(403); return
                 principal = server_self.authenticate_request(method="POST", path=self.path, headers={k.lower(): v for k, v in self.headers.items()}, peer=self.client_address[0] if self.client_address else None)
+                if isawaitable(principal):
+                    close = getattr(principal, "close", None)
+                    if close: close()
+                    server_self.logger.error("Async authentication hook used with MCPServer")
+                    self._empty(500, origin=origin); return
                 if principal is None:
-                    self.send_response(401); self.send_header("WWW-Authenticate", "Bearer"); self.end_headers(); return
+                    self._empty(401, www_authenticate="Bearer", origin=origin); return
                 try:
                     req = loads(body.decode("utf-8"))
                 except JSONDecodeError:
-                    self._json({"jsonrpc":"2.0","error":server_self.create_error(-32700, "Parse error"),"id":None}); return
+                    self._json({"jsonrpc":"2.0","error":server_self.create_error(-32700, "Parse error"),"id":None}, origin=origin); return
                 if not isinstance(req, dict):
-                    self._json(server_self.create_response(None, None, server_self.create_error(-32600, "Invalid Request")))
+                    self._json(server_self.create_response(None, None, server_self.create_error(-32600, "Invalid Request")), origin=origin)
                     return
                 rpc_method = req.get("method")
                 version = self.headers.get("MCP-Protocol-Version")
                 if rpc_method != "initialize" and version not in SUPPORTED_PROTOCOL_VERSIONS:
-                    self.send_error(400); return
+                    self._empty(400, origin=origin); return
                 is_response = rpc_method is None and ("result" in req or "error" in req)
                 is_notification = rpc_method is not None and "id" not in req
                 if is_response:
-                    self.send_response(202)
-                    origin = self._allowed_origin()
-                    if origin: self.send_header("Access-Control-Allow-Origin", origin); self.send_header("Vary", "Origin")
-                    self.send_header("Content-Length", "0"); self.end_headers(); return
+                    self._empty(202, origin=origin); return
                 params = req.get("params") if isinstance(req.get("params"), dict) else {}
                 tool_name = params.get("name") if rpc_method == "tools/call" else None
-                if not server_self.authorize_request(
+                authorized = server_self.authorize_request(
                     principal, rpc_method=rpc_method, tool_name=tool_name
-                ):
-                    self.send_error(403)
+                )
+                if isawaitable(authorized):
+                    close = getattr(authorized, "close", None)
+                    if close: close()
+                    server_self.logger.error("Async authorization hook used with MCPServer")
+                    self._empty(500, origin=origin); return
+                if not authorized:
+                    self._empty(403, origin=origin)
                     return
                 context = MCPRequestContext(
                     transport="streamable-http",
@@ -1424,13 +1472,10 @@ class MCPServer:
                 if is_notification:
                     response = None
                 if response is None:
-                    self.send_response(202)
-                    origin = self._allowed_origin()
-                    if origin: self.send_header("Access-Control-Allow-Origin", origin); self.send_header("Vary", "Origin")
-                    self.send_header("Content-Length", "0"); self.end_headers(); return
-                self._json(response)
+                    self._empty(202, origin=origin); return
+                self._json(response, origin=origin)
 
-        if host not in ("127.0.0.1", "localhost", "::1") and type(self).authenticate_request is MCPServer.authenticate_request:
+        if host not in ("127.0.0.1", "localhost", "::1") and type(self).authenticate_request is MCPServer.authenticate_request and type(self).authenticate is MCPServer.authenticate:
             self.logger.warning("Streamable HTTP is bound beyond loopback without an authentication hook")
         httpd = ThreadingHTTPServer((host, port), _Handler); httpd.daemon_threads = True
         actual_host, actual_port = httpd.server_address[:2]
