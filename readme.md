@@ -124,8 +124,14 @@ Streamable HTTP accepts one JSON-RPC object per `POST`. Requests return
 `200 application/json`; notifications and client responses return `202`.
 The initial `initialize` negotiates either `2025-03-26` or `2024-11-05`.
 Later requests must send a supported value in `MCP-Protocol-Version`.
-Stateless `GET` and `DELETE` return `405`. Browser preflight is only enabled
-for an allowed `Origin`.
+Request targets are matched on the URL path, so `/mcp?trace=1` is accepted
+and treated the same as `/mcp`. HTTP/1.1 requires exactly one `Host` header;
+HTTP/1.0 may omit it. Duplicate `Host`, `Authorization`, `Origin`, `Accept`,
+`Content-Type`, `MCP-Protocol-Version`, `Content-Length`, or
+`Transfer-Encoding` headers are rejected with `400`, and any
+`Transfer-Encoding` is rejected. Stateless `GET` and `DELETE` return `405`.
+Browser preflight is only enabled for an allowed `Origin`, and only on the
+configured endpoint path.
 
 ---
 
@@ -506,7 +512,7 @@ python -m pytest tests/test_resources.py -v
 | `test_streamable_http_regressions.py` | auth, Origin, CORS, limits, context isolation, CLI, and remote-safe errors |
 | `simple_async_test.py` | smoke tests for the async base |
 
-The current suite has **176 tests** covering both bases and runs on Python
+The current suite has **185 tests** covering both bases and runs on Python
 3.10, 3.11, and 3.12.
 
 ---
@@ -630,13 +636,15 @@ If you need network access, prefer **streamable HTTP** over legacy SSE/TCP:
 
 * bind to loopback unless you have a real reason not to;
 * implement `authenticate_request()` and `authorize_request()` for remote use;
+  hook exceptions are logged server-side and returned as generic `500`s;
 * require a supported `MCP-Protocol-Version` on non-`initialize` requests;
 * set `--allowed-origin` explicitly for browser clients, or rely on loopback-only
   Origin handling for local web UIs;
 * expect `OPTIONS` preflight only when the browser sends a valid `Origin`.
 
-A typical reverse-proxy setup should preserve `Authorization`, `Origin`,
-`Accept`, `Content-Type`, and `MCP-Protocol-Version` headers unchanged.
+A typical reverse-proxy setup should preserve `Host`, `Authorization`,
+`Origin`, `Accept`, `Content-Type`, and `MCP-Protocol-Version` headers unchanged,
+and should not inject duplicates or `Transfer-Encoding`.
 If the proxy terminates TLS or auth, keep the upstream `umcp` listener on
 localhost.
 

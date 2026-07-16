@@ -74,19 +74,26 @@ translation on Windows will corrupt JSON-RPC framing in subtle ways.
 **Streamable HTTP** (`--port N --http`, or `--transport streamable-http`).
 A stateless `POST /mcp` accepts one JSON-RPC message and returns either a
 JSON response (`200`) or an empty notification acknowledgement (`202`).
-`GET` and `DELETE` return `405` because this first implementation has no
-stateful sessions or server-initiated stream. `OPTIONS` is only enabled for
-actual browser preflight requests carrying an allowed `Origin`; stray or
-proxy-generated `OPTIONS` without `Origin` get `405`, and disallowed Origins
-get `403`. Non-initialize requests must carry a supported
-`MCP-Protocol-Version`. The transport validates media types, response
-negotiation, Origins, authentication/authorization hooks, and a 4 MiB
-default body limit, with deterministic `400` handling for malformed or
-short request bodies. It binds to loopback unless `--host` is explicitly
-supplied. Remote deployments should override `authenticate_request()` and
-`authorize_request()` or put the service behind a trusted authenticating
-reverse proxy. Session IDs, if added later, are routing identifiers rather
-than credentials.
+Endpoint matching is done on the URL path, so `/mcp?debug=1` is accepted and
+treated the same as `/mcp`. `GET` and `DELETE` return `405` because this
+implementation has no stateful sessions or server-initiated stream. `OPTIONS`
+is only enabled for actual browser preflight requests carrying an allowed
+`Origin`, and only on the configured endpoint path; stray or proxy-generated
+`OPTIONS` without `Origin` get `405`, and disallowed Origins get `403`.
+HTTP/1.1 requires exactly one `Host` header, while HTTP/1.0 may omit it.
+Duplicate `Host`, `Authorization`, `Origin`, `Accept`, `Content-Type`,
+`MCP-Protocol-Version`, `Content-Length`, and `Transfer-Encoding` headers are
+rejected with `400`; any `Transfer-Encoding` is rejected outright.
+Non-initialize requests must carry a supported `MCP-Protocol-Version`. The
+transport validates media types, response negotiation, Origins,
+authentication/authorization hooks, and a 4 MiB default body limit, with
+deterministic `400` handling for malformed or short request bodies. Hook
+exceptions and invalid hook return types are logged server-side and surfaced
+remotely as generic `500`s. It binds to loopback unless `--host` is
+explicitly supplied. Remote deployments should override
+`authenticate_request()` and `authorize_request()` or put the service behind a
+trusted authenticating reverse proxy. Session IDs, if added later, are
+routing identifiers rather than credentials.
 
 Request metadata is exposed safely through `get_request_context()`, backed
 by `contextvars`, so concurrent threads and asyncio tasks cannot overwrite
@@ -100,11 +107,16 @@ fact.
 the MCP Server-Sent Events transport: `GET /sse` opens the event
 stream and emits an `endpoint` event with the per-session POST URL;
 `POST /message?sessionId=...` accepts JSON-RPC requests for that
-session. Useful when the client lives in a different process from the
-server, when you want multiple clients sharing one server, or when the
-client is a web app that can't spawn subprocesses. Bound to localhost
-by default because there's no auth model -- if you need to expose it,
-front it with a reverse proxy that handles authentication.
+session. The protocol shape and URLs stay unchanged for compatibility,
+but the transport now applies the same Origin policy as Streamable HTTP,
+validates `Accept` / `Content-Type`, enforces the same 4 MiB body limit,
+rejects malformed duplicate singleton headers plus any
+`Transfer-Encoding`, and invokes `authenticate_request()` /
+`authorize_request()` on `GET /sse` and `POST /message` when those hooks
+are present. Unlike Streamable HTTP, SSE does not require
+`MCP-Protocol-Version` on POSTs. Default hooks still allow anonymous
+loopback use, so old local clients continue to work unless you add your
+own auth policy.
 
 **TCP** (`--port N --tcp`). Raw TCP socket with newline-delimited
 JSON-RPC. Effectively stdio over a socket. It is kept for compatibility

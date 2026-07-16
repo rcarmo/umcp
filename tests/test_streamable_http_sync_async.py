@@ -23,6 +23,9 @@ class DummyWriter:
     def close(self) -> None:
         self.closed = True
 
+    async def wait_closed(self) -> None:
+        return None
+
     def is_closing(self) -> bool:
         return self.closed
 
@@ -98,6 +101,7 @@ def test_async_streamable_http_accepts_json_and_context():
     body = dumps({"jsonrpc": "2.0", "method": "initialize", "id": 1}).encode()
     request = "\n".join([
         "POST /mcp HTTP/1.1",
+        "Host: test",
         "Content-Type: application/json",
         "Accept: application/json",
         "Origin: http://allowed",

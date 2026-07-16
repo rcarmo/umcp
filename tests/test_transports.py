@@ -22,6 +22,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from contextlib import closing
 from pathlib import Path
@@ -324,6 +325,36 @@ def test_sync_streamable_http_legacy_auth_alias_cors_errors_and_length_guards() 
         os.unlink(script.name)
 
 
+def test_sync_streamable_http_query_host_duplicate_headers_and_options_path() -> None:
+    proc = _spawn("calculator_server.py", "--port", "0", "--http")
+    try:
+        port = _wait_for_port(proc.stdout)
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).encode()
+        query = _http_request(
+            "127.0.0.1", port,
+            b"POST /mcp?via=test HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode() + body,
+        )
+        assert b"200 OK" in query
+        missing_host = _http_request(
+            "127.0.0.1", port,
+            b"POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: 0\r\n\r\n",
+        )
+        assert b"400 Bad Request" in missing_host
+        dup_host = _http_request(
+            "127.0.0.1", port,
+            b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: 0\r\n\r\n",
+        )
+        assert b"400 Bad Request" in dup_host
+        wrong_options = _http_request(
+            "127.0.0.1", port,
+            b"OPTIONS /wrong HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        assert b"405 Method Not Allowed" in wrong_options
+    finally:
+        _kill(proc)
+
+
 def test_sync_streamable_http_rejects_async_auth_hooks_cleanly() -> None:
     script = NamedTemporaryFile("w", suffix=".py", delete=False, dir=str(ROOT))
     try:
@@ -359,6 +390,37 @@ def test_sync_streamable_http_rejects_async_auth_hooks_cleanly() -> None:
 # ---------- sync SSE transport ---------------------------------------------
 
 
+def test_sync_sse_security_origin_and_body_guards() -> None:
+    script = NamedTemporaryFile("w", suffix=".py", delete=False, dir=str(ROOT))
+    try:
+        script.write(
+            "from umcp import MCPServer\n"
+            "from umcp_shared import MCPPrincipal\n"
+            "class S(MCPServer):\n"
+            "    def authenticate_request(self, *, method, path, headers, peer):\n"
+            "        return MCPPrincipal(name='alice') if headers.get('authorization') == 'Bearer ok' else None\n"
+            "    def authorize_request(self, principal, *, rpc_method, tool_name):\n"
+            "        return True\n"
+            "S().run()\n"
+        )
+        script.flush(); script.close()
+        proc = subprocess.Popen([sys.executable, script.name, "--port", "0", "--sse", "--allowed-origin", "http://allowed"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, cwd=str(ROOT))
+        try:
+            port = _wait_for_port(proc.stdout)
+            bad_origin = _http_request("127.0.0.1", port, b"GET /sse HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\nAccept: text/event-stream\r\nAuthorization: Bearer ok\r\nContent-Length: 0\r\n\r\n")
+            assert b"403 Forbidden" in bad_origin
+            unauth = _http_request("127.0.0.1", port, b"GET /sse HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://allowed\r\nAccept: text/event-stream\r\nContent-Length: 0\r\n\r\n")
+            assert b"401 Unauthorized" in unauth and b"Access-Control-Allow-Origin: http://allowed" in unauth
+            bad_media = _http_request("127.0.0.1", port, b"POST /message?sessionId=missing HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://allowed\r\nContent-Type: text/plain\r\nAccept: application/json\r\nAuthorization: Bearer ok\r\nContent-Length: 0\r\n\r\n")
+            assert b"415 Unsupported Media Type" in bad_media and b"Access-Control-Allow-Origin: http://allowed" in bad_media
+            dup_host = _http_request("127.0.0.1", port, b"GET /sse HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nAuthorization: Bearer ok\r\nContent-Length: 0\r\n\r\n")
+            assert b"400 Bad Request" in dup_host
+        finally:
+            _kill(proc)
+    finally:
+        os.unlink(script.name)
+
+
 def test_sync_sse_transport_handshake_and_request() -> None:
     """Start the SSE transport, request /sse stream, then POST a request."""
     proc = _spawn("calculator_server.py", "--port", "0")
@@ -389,6 +451,47 @@ def test_sync_sse_transport_handshake_and_request() -> None:
             assert 200 <= r.status < 300
     finally:
         _kill(proc)
+
+
+def test_sync_sse_session_cleanup_race_returns_404() -> None:
+    script = NamedTemporaryFile("w", suffix=".py", delete=False, dir=str(ROOT))
+    try:
+        script.write(
+            "from umcp import MCPServer\n"
+            "class S(MCPServer):\n"
+            "    def authorize_request(self, principal, *, rpc_method, tool_name):\n"
+            "        with self._sse_lock: self._sse_sessions.clear()\n"
+            "        return True\n"
+            "S().run()\n"
+        )
+        script.flush(); script.close()
+        proc = subprocess.Popen(
+            [sys.executable, script.name, "--port", "0", "--sse"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1, cwd=str(ROOT),
+        )
+        try:
+            port = _wait_for_port(proc.stdout)
+            sse = urllib.request.urlopen(f"http://127.0.0.1:{port}/sse", timeout=2)
+            endpoint = ""
+            for _ in range(20):
+                line = sse.fp.readline()
+                if line.startswith(b"data:"):
+                    endpoint = line.split(b":", 1)[1].strip().decode()
+                    break
+            body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}{endpoint}", data=body,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(request, timeout=2)
+            assert error.value.code == 404
+            sse.close()
+        finally:
+            _kill(proc)
+    finally:
+        os.unlink(script.name)
 
 
 # ---------- CLI surface ----------------------------------------------------

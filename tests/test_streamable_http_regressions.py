@@ -36,6 +36,12 @@ class Writer:
     def close(self) -> None:
         self.closed = True
 
+    async def wait_closed(self) -> None:
+        return None
+
+    def is_closing(self) -> bool:
+        return self.closed
+
     def get_extra_info(self, name: str):
         return ("127.0.0.1", 9999) if name == "peername" else None
 
@@ -177,9 +183,49 @@ class NewAuthAsync(AsyncMCPServer):
         return rpc_method == "initialize" or tool_name != "forbidden"
 
 
-async def _run_async(server: AsyncMCPServer, request: str, body: bytes = b"", max_request_bytes: int = 1024):
+class BadAuthTypeAsync(AsyncMCPServer):
+    async def authenticate_request(self, *, method: str, path: str, headers: dict[str, str], peer: str | None):
+        return "nope"
+
+
+class HookExplodesAsync(AsyncMCPServer):
+    async def authenticate_request(self, *, method: str, path: str, headers: dict[str, str], peer: str | None):
+        raise RuntimeError("boom")
+
+
+class BadAuthorizeTypeAsync(AuthAsync):
+    async def authorize_request(self, principal: MCPPrincipal | None, *, rpc_method: str | None, tool_name: str | None):
+        return "nope"
+
+
+class AuthorizeExplodesAsync(AuthAsync):
+    async def authorize_request(self, principal: MCPPrincipal | None, *, rpc_method: str | None, tool_name: str | None) -> bool:
+        raise RuntimeError("boom")
+
+
+async def _run_async(
+    server: AsyncMCPServer, request: str, body: bytes = b"",
+    max_request_bytes: int = 1024, *, add_host: bool = True,
+):
+    if add_host and "HTTP/1.1" in request and "\nHost:" not in request:
+        first, rest = request.split("\n", 1)
+        request = f"{first}\nHost: test\n{rest}"
     writer = Writer([])
     await server._handle_streamable_http_client(Reader(request, body), writer, "/mcp", ["http://allowed"], max_request_bytes)
+    return writer
+
+
+async def _run_async_sse(server: AsyncMCPServer, request: str, body: bytes = b"", max_request_bytes: int = 1024):
+    writer = Writer([])
+    try:
+        await asyncio.wait_for(
+            server._sse_handle_client(
+                Reader(request, body), writer, ["http://allowed"], max_request_bytes
+            ),
+            timeout=0.05,
+        )
+    except TimeoutError:
+        pass  # A successful SSE GET remains open until the client disconnects.
     return writer
 
 
@@ -518,6 +564,82 @@ def test_remote_transports_hide_internal_errors() -> None:
         context=MCPRequestContext(transport="sse"),
     ))
     assert async_resource["error"]["message"] == "Resource read failed"
+
+
+def test_async_streamable_http_rejects_invalid_host_and_duplicate_singleton_headers() -> None:
+    body = dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).encode()
+    cases = [
+        "POST /mcp HTTP/1.1\nContent-Type: application/json\nAccept: application/json\nContent-Length: %d" % len(body),
+        "POST /mcp HTTP/1.1\nHost: a\nHost: b\nContent-Type: application/json\nAccept: application/json\nContent-Length: %d" % len(body),
+        "POST /mcp HTTP/1.1\nHost: a\nAuthorization: one\nAuthorization: two\nContent-Type: application/json\nAccept: application/json\nContent-Length: %d" % len(body),
+        "POST /mcp HTTP/1.1\nHost: a\nMCP-Protocol-Version: 2025-03-26\nMCP-Protocol-Version: 2025-03-26\nContent-Type: application/json\nAccept: application/json\nContent-Length: %d" % len(body),
+        "POST /mcp HTTP/1.1\nHost: a\nTransfer-Encoding: chunked\nContent-Type: application/json\nAccept: application/json\nContent-Length: %d" % len(body),
+    ]
+    for request in cases:
+        wire = b"".join(asyncio.run(_run_async(
+            AuthAsync(), request, body,
+            add_host=request.startswith("POST /mcp HTTP/1.1\nHost:"),
+        )).chunks)
+        assert b"400 Bad Request" in wire
+
+
+def test_async_streamable_http_http10_allows_missing_host_and_query_path() -> None:
+    body = dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).encode()
+    request = f"POST /mcp?via=test HTTP/1.0\nContent-Type: application/json\nAccept: application/json\nAuthorization: Bearer ok\nContent-Length: {len(body)}"
+    wire = b"".join(asyncio.run(_run_async(AuthAsync(), request, body)).chunks)
+    assert b"200 OK" in wire
+
+
+def test_async_streamable_http_options_only_on_endpoint_and_hook_failures_are_500() -> None:
+    wrong = b"".join(asyncio.run(_run_async(AuthAsync(), "OPTIONS /wrong HTTP/1.1\nHost: x\nOrigin: http://allowed\nContent-Length: 0")).chunks)
+    assert b"405 Method Not Allowed" in wrong
+    body = dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).encode()
+    request = f"POST /mcp HTTP/1.1\nHost: x\nOrigin: http://allowed\nContent-Type: application/json\nAccept: application/json\nContent-Length: {len(body)}"
+    for server in (HookExplodesAsync(), BadAuthTypeAsync()):
+        wire = b"".join(asyncio.run(_run_async(server, request, body)).chunks)
+        assert b"500 Internal Server Error" in wire and b"Access-Control-Allow-Origin: http://allowed" in wire
+    authz_request = f"POST /mcp HTTP/1.1\nHost: x\nOrigin: http://allowed\nContent-Type: application/json\nAccept: application/json\nAuthorization: Bearer ok\nContent-Length: {len(body)}"
+    for server in (AuthorizeExplodesAsync(), BadAuthorizeTypeAsync()):
+        wire = b"".join(asyncio.run(_run_async(server, authz_request, body)).chunks)
+        assert b"500 Internal Server Error" in wire and b"Access-Control-Allow-Origin: http://allowed" in wire
+
+
+def test_async_sse_origin_auth_media_and_body_rules() -> None:
+    get_ok = b"".join(asyncio.run(_run_async_sse(AuthAsync(), "GET /sse HTTP/1.1\nHost: x\nOrigin: http://allowed\nAccept: text/event-stream\nAuthorization: Bearer ok\nContent-Length: 0")).chunks)
+    assert b"200 OK" in get_ok and b"Access-Control-Allow-Origin: http://allowed" in get_ok
+    get_bad_accept = b"".join(asyncio.run(_run_async_sse(AuthAsync(), "GET /sse HTTP/1.1\nHost: x\nAccept: application/json\nAuthorization: Bearer ok\nContent-Length: 0")).chunks)
+    assert b"406 Not Acceptable" in get_bad_accept
+    post_missing_session = b"".join(asyncio.run(_run_async_sse(AuthAsync(), "POST /message?sessionId=missing HTTP/1.1\nHost: x\nOrigin: http://allowed\nContent-Type: application/json\nAccept: application/json\nAuthorization: Bearer ok\nContent-Length: 2", b"{}")).chunks)
+    assert b"404 Not Found" in post_missing_session and b"Access-Control-Allow-Origin: http://allowed" in post_missing_session
+    too_big = b"".join(asyncio.run(_run_async_sse(AuthAsync(), "POST /message?sessionId=missing HTTP/1.1\nHost: x\nContent-Type: application/json\nAccept: application/json\nAuthorization: Bearer ok\nContent-Length: 9", max_request_bytes=8)).chunks)
+    assert b"413 Payload Too Large" in too_big
+
+
+def test_async_sse_session_cleanup_race_returns_404() -> None:
+    class RaceServer(AuthAsync):
+        def authorize_request(self, principal, *, rpc_method, tool_name):
+            self._sse_sessions.pop("s1", None)
+            return True
+
+    server = RaceServer()
+    server._sse_sessions["s1"] = (Writer([]), asyncio.Event(), asyncio.Lock())
+    body = dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
+    request = (
+        "POST /message?sessionId=s1 HTTP/1.1\nHost: x\n"
+        "Content-Type: application/json\nAccept: application/json\n"
+        f"Authorization: Bearer ok\nContent-Length: {len(body)}"
+    )
+    wire = b"".join(asyncio.run(_run_async_sse(server, request, body)).chunks)
+    assert b"404 Not Found" in wire
+
+
+def test_async_sse_hook_failures_and_duplicate_host_are_500_or_400() -> None:
+    req = "GET /sse HTTP/1.1\nHost: x\nHost: y\nAccept: text/event-stream\nContent-Length: 0"
+    assert b"400 Bad Request" in b"".join(asyncio.run(_run_async_sse(AuthAsync(), req)).chunks)
+    req = "GET /sse HTTP/1.1\nHost: x\nOrigin: http://allowed\nAccept: text/event-stream\nContent-Length: 0"
+    for server in (HookExplodesAsync(), BadAuthTypeAsync()):
+        wire = b"".join(asyncio.run(_run_async_sse(server, req)).chunks)
+        assert b"500 Internal Server Error" in wire and b"Access-Control-Allow-Origin: http://allowed" in wire
 
 
 def test_authentication_and_authorization_paths() -> None:

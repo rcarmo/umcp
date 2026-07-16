@@ -4,9 +4,19 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-03-26", "2024-11-05")
+SINGLETON_HTTP_HEADERS = frozenset({
+    "host",
+    "authorization",
+    "origin",
+    "accept",
+    "content-type",
+    "mcp-protocol-version",
+    "content-length",
+    "transfer-encoding",
+})
 
 @dataclass(frozen=True, slots=True)
 class MCPPrincipal:
@@ -61,10 +71,11 @@ def is_jsonrpc_object(value: Any) -> bool:
     return isinstance(value, dict)
 
 
-def media_accepts_json(accept: str | None) -> bool:
-    """Return whether an Accept value permits an application/json response."""
+def media_accepts(accept: str | None, *media_types: str) -> bool:
+    """Return whether an Accept value permits any of *media_types*."""
     if not accept:
         return True
+    normalized = {item.lower() for item in media_types}
     for item in accept.split(","):
         parts = [part.strip().lower() for part in item.split(";")]
         media_type = parts[0]
@@ -75,15 +86,58 @@ def media_accepts_json(accept: str | None) -> bool:
                     quality = float(parameter[2:])
                 except ValueError:
                     quality = 0.0
-        if quality > 0 and media_type in ("*/*", "application/*", "application/json"):
+        if quality <= 0:
+            continue
+        if media_type == "*/*":
+            return True
+        major, _, minor = media_type.partition("/")
+        if minor == "*" and any(candidate.startswith(f"{major}/") for candidate in normalized):
+            return True
+        if media_type in normalized:
             return True
     return False
+
+
+def media_accepts_json(accept: str | None) -> bool:
+    """Return whether an Accept value permits an application/json response."""
+    return media_accepts(accept, "application/json")
+
+
+def media_accepts_event_stream(accept: str | None) -> bool:
+    """Return whether an Accept value permits a text/event-stream response."""
+    return media_accepts(accept, "text/event-stream")
 
 
 def content_type_is_json(content_type: str | None) -> bool:
     if not content_type:
         return False
     return content_type.split(";", 1)[0].strip().lower() == "application/json"
+
+
+def split_request_target(target: str):
+    return urlsplit(target)
+
+
+def request_target_path(target: str) -> str:
+    return split_request_target(target).path or "/"
+
+
+def has_singleton_header_violations(
+    header_counts: Mapping[str, int],
+    *,
+    http_version: str,
+) -> bool:
+    for name in SINGLETON_HTTP_HEADERS:
+        count = header_counts.get(name, 0)
+        if name == "host":
+            if http_version == "HTTP/1.1":
+                if count != 1:
+                    return True
+            elif count > 1:
+                return True
+        elif count > 1:
+            return True
+    return False
 
 
 def origin_is_allowed(
