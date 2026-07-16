@@ -41,6 +41,7 @@ _stdout_bin = _sys.stdout.buffer
 from asyncio import (
     CancelledError,
     Event,
+    IncompleteReadError,
     Lock,
     StreamReader,
     StreamWriter,
@@ -48,8 +49,10 @@ from asyncio import (
     run,
     sleep,
     start_server,
+    wait_for,
 )
 from base64 import b64encode
+from contextvars import copy_context
 import re
 from inspect import (
     Parameter,
@@ -73,8 +76,12 @@ from umcp_shared import (
     MCPPrincipal,
     MCPRequestContext,
     SUPPORTED_PROTOCOL_VERSIONS,
+    content_type_is_json,
     exact_or_fallback,
     get_request_context,
+    is_jsonrpc_object,
+    media_accepts_json,
+    origin_is_allowed,
     reset_request_context,
     set_request_context,
 )
@@ -345,9 +352,11 @@ class AsyncMCPServer:
             if iscoroutinefunction(method):
                 ret = await method(**kwargs)
             else:
-                ret = await get_event_loop().run_in_executor(None, lambda: method(**kwargs))
+                ctx = copy_context()
+                ret = await get_event_loop().run_in_executor(None, lambda: ctx.run(method, **kwargs))
         except Exception as e:  # noqa: BLE001
-            error = self.create_error(-32603, f"Prompt execution error: {e}")
+            message = "Prompt execution failed" if get_request_context().transport == "streamable-http" else f"Prompt execution error: {e}"
+            error = self.create_error(-32603, message)
             return self.create_response(request_id, None, error)
 
         if isinstance(ret, str):
@@ -1044,7 +1053,8 @@ class AsyncMCPServer:
                 if iscoroutinefunction(method):
                     content = await method()
                 else:
-                    content = await get_event_loop().run_in_executor(None, method)
+                    ctx = copy_context()
+                    content = await get_event_loop().run_in_executor(None, lambda: ctx.run(method))
             else:
                 kwargs = {}
                 for param_name, param in sig.parameters.items():
@@ -1065,8 +1075,9 @@ class AsyncMCPServer:
                 if iscoroutinefunction(method):
                     content = await method(**kwargs)
                 else:
+                    ctx = copy_context()
                     content = await get_event_loop().run_in_executor(
-                        None, lambda: method(**kwargs)
+                        None, lambda: ctx.run(method, **kwargs)
                     )
         except ValueError as e:
             return self.create_response(request_id, None, self.create_error(-32602, str(e)))
@@ -1143,7 +1154,7 @@ class AsyncMCPServer:
             error = self.create_error(-32700, "Parse error")
             return self.create_response(None, None, error)
 
-        if not isinstance(request, dict):
+        if not is_jsonrpc_object(request):
             error = self.create_error(-32600, "Invalid Request: top-level JSON value must be an object")
             return self.create_response(None, None, error)
 
@@ -1454,30 +1465,57 @@ class AsyncMCPServer:
     ) -> None:
         peer = writer.get_extra_info('peername')
         try:
-            line = await reader.readline()
-            if not line:
-                return
-            method, path, _ = line.decode('utf-8', errors='replace').strip().split(' ', 2)
-            headers: dict[str,str]={}
-            while True:
-                h = await reader.readline()
-                if h in (b'\r\n', b'\n', b''): break
-                k,_,v=h.decode('utf-8', errors='replace').partition(':')
-                headers[k.strip().lower()] = v.strip()
-            n=int(headers.get('content-length','0') or '0')
+            try:
+                line = await wait_for(reader.readline(), timeout=30.0)
+                if not line or len(line) > 8192:
+                    raise ValueError("invalid request line")
+                parts = line.decode('ascii', errors='strict').strip().split(' ')
+                if len(parts) != 3:
+                    raise ValueError("invalid request line")
+                method, path, _ = parts
+                headers: dict[str, str] = {}
+                header_bytes = 0
+                for _ in range(100):
+                    h = await wait_for(reader.readline(), timeout=30.0)
+                    header_bytes += len(h)
+                    if header_bytes > 65536:
+                        raise ValueError("headers too large")
+                    if h in (b'\r\n', b'\n'):
+                        break
+                    if not h or b':' not in h:
+                        raise ValueError("invalid header")
+                    k, v = h.decode('iso-8859-1').split(':', 1)
+                    headers[k.strip().lower()] = v.strip()
+                else:
+                    raise ValueError("too many headers")
+            except (ValueError, UnicodeError, TimeoutError):
+                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+            try:
+                n=int(headers.get('content-length','0') or '0')
+            except ValueError:
+                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+            if n < 0:
+                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
             if n>max_request_bytes:
                 writer.write(b'HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
-            body=await reader.readexactly(n) if n else b''
+            try:
+                body = await wait_for(reader.readexactly(n), timeout=30.0) if n else b''
+            except (TimeoutError, IncompleteReadError):
+                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
             origin=headers.get('origin')
-            if origin and origin not in allowed_origins and not (host in ('127.0.0.1','localhost','::1') and origin.startswith('http://127.0.0.1')):
+            if origin and not origin_is_allowed(
+                origin, allowed_origins,
+                local_bind=host in ('127.0.0.1', 'localhost', '::1'),
+            ):
                 writer.write(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+            cors = (f'Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n'.encode() if origin else b'')
             if method == 'OPTIONS':
-                writer.write(b'HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, MCP-Protocol-Version, Authorization\r\n\r\n'); await writer.drain(); return
+                writer.write(b'HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n' + cors + b'Access-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, MCP-Protocol-Version, Authorization\r\n\r\n'); await writer.drain(); return
             if method != 'POST' or path != endpoint:
                 writer.write(b'HTTP/1.1 405 Method Not Allowed\r\nAllow: POST, OPTIONS\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
-            if headers.get('content-type','').split(';')[0].strip() != 'application/json':
+            if not content_type_is_json(headers.get('content-type')):
                 writer.write(b'HTTP/1.1 415 Unsupported Media Type\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
-            if 'application/json' not in headers.get('accept','*/*') and '*/*' not in headers.get('accept','*/*'):
+            if not media_accepts_json(headers.get('accept')):
                 writer.write(b'HTTP/1.1 406 Not Acceptable\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
             principal = self.authenticate_request(method='POST', path=path, headers=headers, peer=peer[0] if peer else None)
             if principal is None:
@@ -1487,15 +1525,19 @@ class AsyncMCPServer:
             except JSONDecodeError:
                 resp = self.create_response(None, None, self.create_error(-32700,'Parse error'))
                 data=(dumps(resp)+'\n').encode(); writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n\r\n'.encode()+data); await writer.drain(); return
-            version = headers.get('mcp-protocol-version')
-            if req.get('method') != 'initialize' and version not in SUPPORTED_PROTOCOL_VERSIONS:
-                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
             if not isinstance(req, dict):
                 resp = self.create_response(None, None, self.create_error(-32600, 'Invalid Request'))
                 data = dumps(resp).encode()
                 writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n\r\n'.encode() + data)
                 await writer.drain(); return
             rpc_method = req.get('method')
+            version = headers.get('mcp-protocol-version')
+            if rpc_method != 'initialize' and version not in SUPPORTED_PROTOCOL_VERSIONS:
+                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
+            is_response = rpc_method is None and ('result' in req or 'error' in req)
+            is_notification = rpc_method is not None and 'id' not in req
+            if is_response:
+                writer.write(b'HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n' + cors + b'\r\n'); await writer.drain(); return
             params = req.get('params') if isinstance(req.get('params'), dict) else {}
             tool_name = params.get('name') if rpc_method == 'tools/call' else None
             if not self.authorize_request(principal, rpc_method=rpc_method, tool_name=tool_name):
@@ -1507,9 +1549,11 @@ class AsyncMCPServer:
                 peer=peer[0] if peer else None, headers=headers,
             )
             response = await self.process_request_async(dumps(req), context=context)
+            if is_notification:
+                response = None
             if response is None:
-                writer.write(b'HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n'); await writer.drain(); return
-            data=(dumps(response)+'\n').encode(); writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n\r\n'.encode()+data); await writer.drain()
+                writer.write(b'HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n' + cors + b'\r\n'); await writer.drain(); return
+            data=(dumps(response)+'\n').encode(); writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n'.encode() + cors + b'\r\n' + data); await writer.drain()
         finally:
             writer.close()
 
@@ -1563,12 +1607,25 @@ class AsyncMCPServer:
                 max_request_bytes = int(args[i + 1]); i += 2
             elif args[i] == "--allowed-origin" and i + 1 < len(args):
                 allowed_origins.append(args[i + 1]); i += 2
-            elif args[i] == "--tcp":
-                use_tcp = True; transport = "tcp"; i += 1
-            elif args[i] in ("--http", "--sse"):
-                transport = "streamable-http" if args[i] == "--http" else "sse"; i += 1
+            elif args[i] == "--transport" and i + 1 < len(args):
+                selected = args[i + 1]
+                if transport is not None and transport != selected:
+                    raise ValueError("conflicting transport options")
+                transport = selected; i += 2
+            elif args[i] in ("--tcp", "--http", "--sse"):
+                selected = {"--tcp": "tcp", "--http": "streamable-http", "--sse": "sse"}[args[i]]
+                if transport is not None and transport != selected:
+                    raise ValueError("conflicting transport options")
+                use_tcp = selected == "tcp"; transport = selected; i += 1
             else:
                 remaining.append(args[i]); i += 1
+        valid_transports = {"stdio", "streamable-http", "sse", "tcp"}
+        if transport not in valid_transports | {None}:
+            raise ValueError(f"unsupported transport: {transport}")
+        if transport not in (None, "stdio") and port is None:
+            raise ValueError("network transports require --port")
+        if transport == "stdio" and port is not None:
+            raise ValueError("stdio transport cannot use --port")
         if port is not None:
             mode = transport or ("tcp" if use_tcp else "sse")
             if mode == "tcp":

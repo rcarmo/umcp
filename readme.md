@@ -356,7 +356,7 @@ Base class for synchronous MCP servers.
 * `handle_prompt_get()` -- dispatches a prompt fetch.
 * `get_config()` -- override to declare server name, version, capabilities.
 * `get_instructions()` -- override to give the model session-level guidance.
-* `run()` -- start the server on the configured transport (stdio by default; pass `--port N` for SSE, `--http` for streamable HTTP, add `--tcp` for raw TCP).
+* `run()` -- start the server on the configured transport (stdio by default; pass `--port N` for SSE, `--http` for streamable HTTP, add `--tcp` for raw TCP, or use `--transport {sse,streamable-http,tcp}`).
 
 #### `AsyncMCPServer` (`aioumcp.py`)
 

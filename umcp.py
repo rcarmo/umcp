@@ -55,7 +55,6 @@ from inspect import (
     ismethod,
     signature,
 )
-from contextvars import copy_context
 from json import JSONDecodeError, dumps, loads
 from logging import INFO, FileHandler, basicConfig, getLogger
 from pathlib import Path
@@ -63,8 +62,12 @@ from umcp_shared import (
     MCPPrincipal,
     MCPRequestContext,
     SUPPORTED_PROTOCOL_VERSIONS,
+    content_type_is_json,
     exact_or_fallback,
     get_request_context,
+    is_jsonrpc_object,
+    media_accepts_json,
+    origin_is_allowed,
     reset_request_context,
     set_request_context,
 )
@@ -349,7 +352,8 @@ class MCPServer:
         try:
             ret = method(**kwargs)
         except Exception as e:  # noqa: BLE001
-            error = self.create_error(-32603, f"Prompt execution error: {e}")
+            message = "Prompt execution failed" if get_request_context().transport == "streamable-http" else f"Prompt execution error: {e}"
+            error = self.create_error(-32603, message)
             return self.create_response(request_id, None, error)
 
         if isinstance(ret, str):
@@ -1135,7 +1139,7 @@ class MCPServer:
             error = self.create_error(-32700, "Parse error")
             return self.create_response(None, None, error)
 
-        if not isinstance(request, dict):
+        if not is_jsonrpc_object(request):
             error = self.create_error(-32600, "Invalid Request: top-level JSON value must be an object")
             return self.create_response(None, None, error)
 
@@ -1269,9 +1273,10 @@ class MCPServer:
                 origin = self.headers.get("Origin")
                 if not origin:
                     return None
-                if origin in allowed_origins:
-                    return origin
-                if host in ("127.0.0.1", "localhost", "::1") and origin.startswith("http://127.0.0.1"):
+                if origin_is_allowed(
+                    origin, allowed_origins,
+                    local_bind=host in ("127.0.0.1", "localhost", "::1"),
+                ):
                     return origin
                 return None
 
@@ -1279,6 +1284,10 @@ class MCPServer:
                 body = dumps(payload).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
+                origin = self._allowed_origin()
+                if origin:
+                    self.send_header("Access-Control-Allow-Origin", origin)
+                    self.send_header("Vary", "Origin")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers(); self.wfile.write(body)
 
@@ -1300,16 +1309,24 @@ class MCPServer:
 
             def do_POST(self) -> None:  # noqa: N802
                 if self.path != endpoint:
-                    self.send_error(405); self.send_header("Allow", "POST, OPTIONS"); return
-                if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json": self.send_error(415); return
-                acc = self.headers.get("Accept", "*/*")
-                if "application/json" not in acc and "*/*" not in acc: self.send_error(406); return
+                    self.send_response(405)
+                    self.send_header("Allow", "POST, OPTIONS")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if not content_type_is_json(self.headers.get("Content-Type")):
+                    self.send_error(415); return
+                if not media_accepts_json(self.headers.get("Accept")):
+                    self.send_error(406); return
                 cl = self.headers.get("Content-Length")
                 try:
                     n = int(cl) if cl is not None else 0
                 except ValueError:
                     self.send_error(400); return
-                if n > max_request_bytes: self.send_error(413); return
+                if n < 0:
+                    self.send_error(400); return
+                if n > max_request_bytes:
+                    self.send_error(413); return
                 body = self.rfile.read(n)
                 origin = self._allowed_origin()
                 if self.headers.get("Origin") and not origin:
@@ -1321,13 +1338,20 @@ class MCPServer:
                     req = loads(body.decode("utf-8"))
                 except JSONDecodeError:
                     self._json({"jsonrpc":"2.0","error":server_self.create_error(-32700, "Parse error"),"id":None}); return
-                version = self.headers.get("MCP-Protocol-Version")
-                if req.get("method") != "initialize" and version not in SUPPORTED_PROTOCOL_VERSIONS:
-                    self.send_error(400); return
                 if not isinstance(req, dict):
                     self._json(server_self.create_response(None, None, server_self.create_error(-32600, "Invalid Request")))
                     return
                 rpc_method = req.get("method")
+                version = self.headers.get("MCP-Protocol-Version")
+                if rpc_method != "initialize" and version not in SUPPORTED_PROTOCOL_VERSIONS:
+                    self.send_error(400); return
+                is_response = rpc_method is None and ("result" in req or "error" in req)
+                is_notification = rpc_method is not None and "id" not in req
+                if is_response:
+                    self.send_response(202)
+                    origin = self._allowed_origin()
+                    if origin: self.send_header("Access-Control-Allow-Origin", origin); self.send_header("Vary", "Origin")
+                    self.send_header("Content-Length", "0"); self.end_headers(); return
                 params = req.get("params") if isinstance(req.get("params"), dict) else {}
                 tool_name = params.get("name") if rpc_method == "tools/call" else None
                 if not server_self.authorize_request(
@@ -1345,10 +1369,17 @@ class MCPServer:
                     headers={k.lower(): v for k, v in self.headers.items()},
                 )
                 response = server_self.process_request(dumps(req), context=context)
+                if is_notification:
+                    response = None
                 if response is None:
-                    self.send_response(202); self.send_header("Content-Length", "0"); self.end_headers(); return
+                    self.send_response(202)
+                    origin = self._allowed_origin()
+                    if origin: self.send_header("Access-Control-Allow-Origin", origin); self.send_header("Vary", "Origin")
+                    self.send_header("Content-Length", "0"); self.end_headers(); return
                 self._json(response)
 
+        if host not in ("127.0.0.1", "localhost", "::1") and type(self).authenticate_request is MCPServer.authenticate_request:
+            self.logger.warning("Streamable HTTP is bound beyond loopback without an authentication hook")
         httpd = ThreadingHTTPServer((host, port), _Handler); httpd.daemon_threads = True
         actual_host, actual_port = httpd.server_address[:2]
         print(f"MCP Streamable HTTP Server listening on http://{actual_host}:{actual_port}{endpoint}", flush=True)
@@ -1522,16 +1553,27 @@ class MCPServer:
                 max_request_bytes = int(args[i + 1]); i += 2
             elif args[i] == "--allowed-origin" and i + 1 < len(args):
                 allowed_origins.append(args[i + 1]); i += 2
-            elif args[i] in ("--transport",) and i + 1 < len(args):
-                transport = args[i + 1]; i += 2
-            elif args[i] == "--tcp":
-                use_tcp = True; transport = "tcp"; i += 1
-            elif args[i] in ("--http", "--sse"):
-                transport = "streamable-http" if args[i] == "--http" else "sse"; i += 1
+            elif args[i] == "--transport" and i + 1 < len(args):
+                selected = args[i + 1]
+                if transport is not None and transport != selected:
+                    raise ValueError("conflicting transport options")
+                transport = selected; i += 2
+            elif args[i] in ("--tcp", "--http", "--sse"):
+                selected = {"--tcp": "tcp", "--http": "streamable-http", "--sse": "sse"}[args[i]]
+                if transport is not None and transport != selected:
+                    raise ValueError("conflicting transport options")
+                use_tcp = selected == "tcp"; transport = selected; i += 1
             else:
                 remaining.append(args[i])
                 i += 1
 
+        valid_transports = {"stdio", "streamable-http", "sse", "tcp"}
+        if transport not in valid_transports | {None}:
+            raise ValueError(f"unsupported transport: {transport}")
+        if transport not in (None, "stdio") and port is None:
+            raise ValueError("network transports require --port")
+        if transport == "stdio" and port is not None:
+            raise ValueError("stdio transport cannot use --port")
         if port is not None:
             mode = transport or ("tcp" if use_tcp else "sse")
             if mode == "tcp": self.run_socket(host=host, port=port)
