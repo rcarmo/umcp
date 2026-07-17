@@ -65,6 +65,26 @@ def test_sync_wrong_jsonrpc_version_rejected() -> None:
     assert resp["error"]["code"] == -32600
 
 
+def test_sync_invalid_ids_and_malformed_responses_are_rejected() -> None:
+    server = _SyncProtoServer()
+    for request in (
+        {"jsonrpc": "2.0", "id": {"bad": 1}, "method": "initialize"},
+        {"jsonrpc": "2.0", "id": [1], "method": "initialize"},
+        {"jsonrpc": "2.0", "id": True, "method": "initialize"},
+        {"jsonrpc": "2.0", "id": 1.5, "method": "initialize"},
+        {"jsonrpc": "2.0", "result": 1},
+        {"jsonrpc": "2.0", "id": 1, "result": 1, "error": {}},
+        {"jsonrpc": "2.0", "id": 1, "error": 1},
+    ):
+        response = _send_sync(server, request)
+        assert response["error"]["code"] == -32600
+    for constant in ("NaN", "Infinity", "-Infinity"):
+        response = server.process_request(
+            f'{{"jsonrpc":"2.0","id":{constant},"method":"initialize"}}'
+        )
+        assert response["error"]["code"] == -32700
+
+
 def test_sync_missing_or_non_string_method_is_invalid_request() -> None:
     server = _SyncProtoServer()
     for request in (
@@ -174,6 +194,26 @@ def test_async_non_object_top_level_json_is_invalid_request() -> None:
     s = _AsyncProtoServer()
     resp = _send_async(s, "[]")
     assert resp["error"]["code"] == -32600
+
+
+def test_async_invalid_ids_and_malformed_responses_are_rejected() -> None:
+    server = _AsyncProtoServer()
+    for request in (
+        {"jsonrpc": "2.0", "id": {"bad": 1}, "method": "initialize"},
+        {"jsonrpc": "2.0", "id": [1], "method": "initialize"},
+        {"jsonrpc": "2.0", "id": True, "method": "initialize"},
+        {"jsonrpc": "2.0", "id": 1.5, "method": "initialize"},
+        {"jsonrpc": "2.0", "result": 1},
+        {"jsonrpc": "2.0", "id": 1, "result": 1, "error": {}},
+        {"jsonrpc": "2.0", "id": 1, "error": 1},
+    ):
+        response = _send_async(server, request)
+        assert response["error"]["code"] == -32600
+    for constant in ("NaN", "Infinity", "-Infinity"):
+        response = asyncio.run(server.process_request_async(
+            f'{{"jsonrpc":"2.0","id":{constant},"method":"initialize"}}'
+        ))
+        assert response["error"]["code"] == -32700
 
 
 def test_async_missing_or_non_string_method_is_invalid_request() -> None:

@@ -70,6 +70,30 @@ def test_async_initialize_negotiation_matches_sync():
     assert response["result"]["protocolVersion"] == "2024-11-05"
 
 
+def test_sync_initialize_capabilities_are_exact() -> None:
+    response = MCPServer().process_request(json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {},
+    }))
+    assert response["result"]["capabilities"] == {
+        "tools": {"listChanged": True},
+        "prompts": {"get": True, "listChanged": True},
+        "resources": {"subscribe": True, "listChanged": True},
+        "logging": {},
+    }
+
+
+def test_async_initialize_capabilities_match_sync_exactly() -> None:
+    response = asyncio.run(AsyncMCPServer().process_request_async(json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {},
+    })))
+    assert response["result"]["capabilities"] == {
+        "tools": {"listChanged": True},
+        "prompts": {"get": True, "listChanged": True},
+        "resources": {"subscribe": True, "listChanged": True},
+        "logging": {},
+    }
+
+
 def test_request_context_headers_are_defensively_immutable():
     headers = {"x-test": "one"}
     ctx = MCPRequestContext(headers=headers)

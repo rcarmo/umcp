@@ -28,6 +28,12 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pytest pytest-asyncio coverage
 
+      - name: Build and smoke-test wheel
+        run: |
+          python -m pip wheel . --no-deps --wheel-dir dist
+          python -m pip install --no-deps --target /tmp/umcp-wheel dist/umcp-*.whl
+          cd /tmp && PYTHONPATH=/tmp/umcp-wheel python -c "import umcp, aioumcp, umcp_shared"
+
       - name: Run test suite
         run: python -m pytest tests/ -v
 

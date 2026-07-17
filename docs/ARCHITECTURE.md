@@ -132,6 +132,12 @@ transport is responsible for delivering it.
 The discovery rule is one line: any method on the subclass whose name
 starts with `tool_` is a tool. The MCP-visible name is everything after
 the prefix. So `tool_get_movies` exposes a tool called `get_movies`.
+Runtime-registered tools from `register_tool()` participate in the same
+catalogue and override naming-convention entries with the same public
+name. `register_tool()` / `unregister_tool()` are mutation-only; callers
+must explicitly emit `notify_tool_list_changed()` unless they use the
+convenience wrappers `register_tool_and_notify()` /
+`unregister_tool_and_notify()`.
 
 For each tool, `discover_tools()` does the following:
 
@@ -145,7 +151,10 @@ For each tool, `discover_tools()` does the following:
    unknown arguments are rejected at validation time, not silently
    ignored.
 5. Infers MCP annotations from the tool's name (see below).
-6. Returns the lot as the tool definition the client will see in
+6. Infers an `outputSchema` from the return annotation when possible, or
+   honours explicit `_mcp_output_schema` / `register_tool(...,
+   output_schema=...)` metadata.
+7. Returns the lot as the tool definition the client will see in
    `tools/list`.
 
 The naming-convention discovery has two practical consequences. First,
@@ -253,7 +262,12 @@ the docstring is parsed out and surfaced as the prompt's `categories`
 field.
 
 `prompts/list` and `prompts/get` are the two relevant MCP methods,
-both implemented. The return value of a prompt method can be a string
+both implemented. Runtime-registered prompts from `register_prompt()`
+use the same metadata shape and dispatch path; `register_prompt()` /
+`unregister_prompt()` are mutation-only unless paired with
+`notify_prompt_list_changed()` or the convenience wrappers
+`register_prompt_and_notify()` / `unregister_prompt_and_notify()`.
+The return value of a prompt method can be a string
 (returned as a single user message), a list (returned as a sequence of
 messages), or a dict (returned verbatim). See [`PROMPTS.md`](PROMPTS.md)
 for the full prompt API and examples.
@@ -265,11 +279,16 @@ The naming convention is `resource_<name>` for static resources and
 `resource_template_<name>` for parameterised ones; the parameter list of
 the templated method becomes the URI placeholders. The library handles
 all five `resources/*` JSON-RPC methods (`list`, `templates/list`,
-`read`, `subscribe`, `unsubscribe`) plus the two notifications
-(`notifications/resources/list_changed` and
-`notifications/resources/updated`), and declares the `resources`
-capability with `subscribe` and `listChanged` set to `true` on
-`initialize`.
+`read`, `subscribe`, `unsubscribe`) plus paginated `tools/list`,
+`prompts/list`, `resources/list`, and `resources/templates/list`.
+Discovery results are stably sorted by public identity and preserve the
+old one-shot behaviour when no pagination params are supplied. The
+notification set includes `notifications/tools/list_changed`,
+`notifications/prompts/list_changed`,
+`notifications/resources/list_changed`, and
+`notifications/resources/updated`. On `initialize`, the capabilities
+advertise `tools.listChanged`, `prompts.get`, `prompts.listChanged`, and
+`resources.subscribe` / `resources.listChanged`.
 
 The URI is auto-generated as `umcp://<ServerClassName>/<name>` (or
 `umcp://<ServerClassName>/<name>/{p1}/{p2}` for templates), but a
@@ -300,7 +319,9 @@ method as keyword arguments.
 
 For runtime registration, `register_resource(uri, callable, ...)` and
 `register_resource_template(uri_template, callable, ...)` add resources
-that aren't methods on the subclass. Useful when the resource set is
+that aren't methods on the subclass. Tools and prompts have matching
+runtime APIs (`register_tool`, `unregister_tool`, `register_prompt`,
+`unregister_prompt`). Useful when the resource set is
 data-driven (config files, items in a database) rather than known at
 import time.
 
@@ -337,6 +358,13 @@ Logging is set up automatically: every server writes to
 goes to a file rather than stderr because stderr is sometimes
 multiplexed with the protocol stream by clients that don't separate
 them carefully.
+
+Separately from that local server log, the runtime also supports MCP
+`logging/setLevel` plus `notifications/message` for host-visible log
+messages. Those notifications are thresholded by the negotiated MCP log
+level, include the optional `logger` field only when supplied, and
+sanitize likely secrets recursively unless the caller passes
+`sanitize=False`.
 
 ## What `umcp` deliberately doesn't do
 

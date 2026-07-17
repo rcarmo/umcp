@@ -11,6 +11,11 @@ Prompt templates in `umcp` allow you to create reusable, structured prompt defin
 ### Naming Convention
 
 Any method named `prompt_<name>` is automatically treated as a prompt definition.
+You can also add or remove prompts at runtime with `register_prompt()` and
+`unregister_prompt()`. Those methods only mutate local state; call
+`notify_prompt_list_changed()` yourself afterwards, or use the
+convenience wrappers `register_prompt_and_notify()` and
+`unregister_prompt_and_notify()`.
 
 ### Introspection
 
@@ -139,6 +144,10 @@ async def prompt_fetch_and_summarize(self, url: str, max_length: int = 500) -> s
   "method": "prompts/list"
 }
 ```
+
+`prompts/list` returns the full stable-sorted catalogue by default. If you
+pass `pageSize`, the response is paginated and may include `nextCursor`;
+invalid cursors are rejected with `-32602`.
 
 **Response:**
 

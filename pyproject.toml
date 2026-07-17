@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "umcp"
 version = "0.2.0"
@@ -14,6 +18,9 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
+
+[tool.setuptools]
+py-modules = ["umcp", "aioumcp", "umcp_shared"]
 
 [project.urls]
 Homepage = "https://github.com/rcarmo/umcp"

@@ -154,7 +154,7 @@ def test_prompts_get_unknown_argument_returns_invalid_params() -> None:
 
 def test_initialize_declares_prompts_capability() -> None:
     resp = _send(_Sync(), {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
-    assert "prompts" in resp["result"]["capabilities"]
+    assert resp["result"]["capabilities"]["prompts"] == {"get": True, "listChanged": True}
 
 
 # ---------- async prompts ---------------------------------------------------

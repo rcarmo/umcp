@@ -45,14 +45,17 @@ from asyncio import (
     Lock,
     StreamReader,
     StreamWriter,
+    current_task,
     get_event_loop,
     run,
     sleep,
     start_server,
     wait_for,
 )
-from base64 import b64encode
+from base64 import b64encode, urlsafe_b64decode, urlsafe_b64encode
 from contextvars import copy_context
+from dataclasses import MISSING, asdict, fields, is_dataclass
+from enum import Enum
 import re
 from inspect import (
     Parameter,
@@ -64,32 +67,76 @@ from inspect import (
     ismethod,
     signature,
 )
-from json import JSONDecodeError, dumps, loads
+import math
+from json import JSONDecodeError, dumps, loads as _json_loads
 from logging import INFO, FileHandler, basicConfig, getLogger
 from pathlib import Path
 from sys import argv, exit
 from types import UnionType
 from typing import Any, Literal, Mapping, Union, get_args, get_origin, get_type_hints, is_typeddict
+
+
+_STRUCTURED_UNSET = object()
 from urllib.parse import parse_qs
 from uuid import uuid4
 
 from umcp_shared import (
+    MCPCancellationState,
     MCPPrincipal,
+    MCPRequestCancelled,
     MCPRequestContext,
+    MCPRequestRuntime,
     SUPPORTED_PROTOCOL_VERSIONS,
     content_type_is_json,
     exact_or_fallback,
+    get_progress_token as _get_progress_token,
     get_request_context,
+    get_request_runtime,
+    has_ambiguous_singleton_values,
     has_singleton_header_violations,
     is_jsonrpc_object,
+    is_request_cancelled as _is_request_cancelled,
+    is_valid_jsonrpc_id,
+    is_valid_jsonrpc_response,
     media_accepts_event_stream,
     media_accepts_json,
     origin_is_allowed,
+    raise_if_cancelled as _raise_if_cancelled,
     request_target_path,
     reset_request_context,
+    reset_request_runtime,
     set_request_context,
+    set_request_runtime,
 )
 
+
+def _reject_json_constant(value: str) -> None:
+    raise JSONDecodeError(f"Invalid JSON constant: {value}", value, 0)
+
+
+def loads(value: str | bytes) -> Any:
+    return _json_loads(value, parse_constant=_reject_json_constant)
+
+
+def get_progress_token() -> str | int | None:
+    return _get_progress_token()
+
+
+def is_request_cancelled() -> bool:
+    return _is_request_cancelled()
+
+
+def raise_if_cancelled() -> None:
+    _raise_if_cancelled()
+
+
+async def notify_progress(progress: float | int, total: float | int | None = None, message: str | None = None) -> None:
+    runtime = get_request_runtime()
+    if runtime is None or runtime.progress_callback is None:
+        return
+    result = runtime.progress_callback(progress, total, message)
+    if isawaitable(result):
+        await result
 
 class AsyncMCPServer:
     """Async MCP server implementation using JSON-RPC 2.0 protocol with asyncio."""
@@ -105,12 +152,21 @@ class AsyncMCPServer:
         # Resource state.
         self._resource_subscriptions: set[str] = set()
         self._resource_session_subscriptions: dict[str, set[str]] = {}
+        self._dynamic_tools: dict[str, tuple[dict[str, Any], Any]] = {}
+        self._dynamic_prompts: dict[str, tuple[dict[str, Any], Any]] = {}
         self._dynamic_resources: dict[str, tuple[dict[str, Any], Any]] = {}
         self._dynamic_resource_templates: list[tuple[dict[str, Any], Any]] = []
+        self._completion_providers: dict[tuple[str, str, str], Any] = {}
+        self.default_list_page_size: int | None = None
+        self.max_completion_values: int = 100
+        self.logging_level: str = "info"
+        self._request_registry_lock = Lock()
+        self._active_requests_by_id: dict[str | int, dict[str, Any]] = {}
+        self._active_requests_by_progress_token: dict[str | int, set[str | int]] = {}
         # SSE session map -- populated by run_sse_async; declared here so
         # notification helpers can introspect it from any context.
-        # session_id -> (writer, disconnect_event, write_lock)
-        self._sse_sessions: dict[str, tuple[StreamWriter, Event, Lock]] = {}
+        # session_id -> (writer, disconnect_event, write_lock, principal name)
+        self._sse_sessions: dict[str, tuple[StreamWriter, Event, Lock, str]] = {}
 
     def _setup_logging(self) -> None:
         """Set up logging configuration."""
@@ -136,25 +192,27 @@ class AsyncMCPServer:
           * Prompt capabilities
           * Dynamic instructions string
         """
+        capabilities: dict[str, Any] = {
+            "tools": {"listChanged": True},
+            "prompts": {
+                "get": True,
+                "listChanged": True,
+            },
+            "resources": {
+                "subscribe": True,
+                "listChanged": True,
+            },
+            "logging": {},
+        }
+        if self._has_completion_support():
+            capabilities["completions"] = {}
         return {
             "protocolVersion": SUPPORTED_PROTOCOL_VERSIONS[0],
             "serverInfo": {
                 "name": self.__class__.__name__,
                 "version": "0.1.0"
             },
-            "capabilities": {
-                "tools": {
-                    "listChanged": True
-                },
-                "prompts": {
-                    "listChanged": True,
-                    "get": True,
-                },
-                "resources": {
-                    "subscribe": True,
-                    "listChanged": True,
-                }
-            },
+            "capabilities": capabilities,
             "instructions": self.get_instructions()
         }
 
@@ -162,15 +220,71 @@ class AsyncMCPServer:
         """Get server-specific instructions. Override in subclasses."""
         return "This server provides tool functionality via the Model Context Protocol."
 
+    def _empty_object_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
+
+    def _sort_discovery_items(self, items: list[dict[str, Any]], *keys: str) -> list[dict[str, Any]]:
+        return sorted(items, key=lambda item: tuple(str(item.get(key, "")) for key in keys))
+
+    def _cursor_fingerprint(self, label: str, items: list[dict[str, Any]], identity_keys: tuple[str, ...]) -> str:
+        principal = get_request_context().principal or ""
+        basis = [principal, label]
+        for item in items:
+            basis.append("\x1f".join(str(item.get(key, "")) for key in identity_keys))
+        return urlsafe_b64encode("\n".join(basis).encode("utf-8")).decode("ascii").rstrip("=")
+
+    def _encode_cursor(self, label: str, offset: int, fingerprint: str) -> str:
+        payload = dumps({"v": 1, "l": label, "o": offset, "f": fingerprint}, separators=(",", ":"))
+        return urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+
+    def _decode_cursor(self, cursor: str, *, label: str, fingerprint: str) -> int:
+        try:
+            padded = cursor + "=" * (-len(cursor) % 4)
+            payload = _json_loads(urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("Invalid cursor") from exc
+        if not isinstance(payload, dict) or payload.get("v") != 1 or payload.get("l") != label:
+            raise ValueError("Invalid cursor")
+        offset = payload.get("o")
+        if not isinstance(offset, int) or offset < 0 or payload.get("f") != fingerprint:
+            raise ValueError("Invalid cursor")
+        return offset
+
+    def _page_list(
+        self,
+        *,
+        label: str,
+        items: list[dict[str, Any]],
+        result_key: str,
+        identity_keys: tuple[str, ...],
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        cursor = params.get("cursor")
+        page_size = params.get("pageSize")
+        if page_size is not None and (not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0):
+            raise ValueError("Invalid params: 'pageSize' must be a positive integer")
+        if cursor is not None and not isinstance(cursor, str):
+            raise ValueError("Invalid params: 'cursor' must be a string")
+        if cursor is None and page_size is None:
+            return {result_key: items}
+
+        page_size = page_size or self.default_list_page_size or 50
+        fingerprint = self._cursor_fingerprint(label, items, identity_keys)
+        start = 0 if cursor is None else self._decode_cursor(cursor, label=label, fingerprint=fingerprint)
+        page = items[start:start + page_size]
+        result: dict[str, Any] = {result_key: page}
+        next_offset = start + len(page)
+        if next_offset < len(items):
+            result["nextCursor"] = self._encode_cursor(label, next_offset, fingerprint)
+        return result
+
     def discover_tools(self) -> dict[str, Any]:
-        """Discover tools by introspecting methods that start with 'tool_'.
-
-        Returns a strict MCP-compliant tools/list response.  Every tool
-        definition includes ``name``, ``description``, and ``inputSchema``
-        (the spec requires this even for parameter-less tools).
-        """
-        tools = []
-
+        """Discover tools via naming convention and runtime registration."""
+        tools_by_name: dict[str, dict[str, Any]] = {}
         for name, method in getmembers(self, predicate=ismethod):
             if not name.startswith('tool_'):
                 continue
@@ -181,18 +295,56 @@ class AsyncMCPServer:
             tool_def = {
                 "name": tool_name,
                 "description": doc,
-                # MCP spec requires inputSchema; default to empty object schema
-                "inputSchema": parameters if parameters else {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                },
+                "inputSchema": parameters if parameters else self._empty_object_schema(),
             }
+            output_schema = self._tool_output_schema(method)
+            if output_schema is not None:
+                tool_def["outputSchema"] = output_schema
             annotations = self._infer_tool_annotations(tool_name, method)
             if annotations:
                 tool_def["annotations"] = annotations
-            tools.append(tool_def)
-        return {"tools": tools}
+            tools_by_name[tool_name] = tool_def
+        for tool_name, (meta, _callable) in self._dynamic_tools.items():
+            tools_by_name[tool_name] = dict(meta)
+        return {"tools": self._sort_discovery_items(list(tools_by_name.values()), "name")}
+
+    def register_tool(
+        self,
+        name: str,
+        callable_: Any,
+        *,
+        description: str | None = None,
+        input_schema: dict[str, Any] | None = None,
+        output_schema: dict[str, Any] | None = None,
+        annotations: dict[str, Any] | None = None,
+    ) -> None:
+        meta: dict[str, Any] = {
+            "name": name,
+            "description": description or (getdoc(callable_) or f"Execute {name} tool"),
+            "inputSchema": dict(input_schema) if input_schema else self._extract_parameters_from_signature(signature(callable_), callable_) or self._empty_object_schema(),
+        }
+        inferred_output_schema = output_schema if output_schema is not None else self._tool_output_schema(callable_)
+        if inferred_output_schema is not None:
+            meta["outputSchema"] = dict(inferred_output_schema)
+        tool_annotations = annotations if annotations is not None else self._infer_tool_annotations(name, callable_)
+        if tool_annotations:
+            meta["annotations"] = dict(tool_annotations)
+        self._dynamic_tools[name] = (meta, callable_)
+
+    async def register_tool_and_notify(self, name: str, callable_: Any, **kwargs: Any) -> None:
+        """Register a tool and immediately emit ``tools/list_changed``."""
+        self.register_tool(name, callable_, **kwargs)
+        await self.notify_tool_list_changed()
+
+    def unregister_tool(self, name: str) -> bool:
+        return self._dynamic_tools.pop(name, None) is not None
+
+    async def unregister_tool_and_notify(self, name: str) -> bool:
+        """Unregister a tool and emit ``tools/list_changed`` only on success."""
+        removed = self.unregister_tool(name)
+        if removed:
+            await self.notify_tool_list_changed()
+        return removed
 
     @staticmethod
     def _infer_tool_annotations(tool_name: str, method: Any) -> dict[str, bool]:
@@ -248,12 +400,8 @@ class AsyncMCPServer:
 
     # --- Prompt discovery & handling (ported from synchronous server) ---
     def discover_prompts(self) -> dict[str, Any]:
-        """Discover available prompts through introspection.
-
-        A prompt is any method whose name starts with 'prompt_'. Its docstring
-        becomes the description and its signature is converted to a JSON schema.
-        """
-        prompts = []
+        """Discover prompts via naming convention and runtime registration."""
+        prompts_by_name: dict[str, dict[str, Any]] = {}
         for name, method in getmembers(self, predicate=ismethod):
             if not name.startswith('prompt_'):
                 continue
@@ -262,13 +410,48 @@ class AsyncMCPServer:
             doc = getdoc(method) or f"Prompt template {prompt_name}"
             parameters = self._extract_parameters_from_signature(sig, method)
             categories = self._extract_prompt_categories(doc)
-            prompts.append({
+            prompts_by_name[prompt_name] = {
                 "name": prompt_name,
                 "description": doc,
-                "inputSchema": parameters or {},
-                "categories": categories
-            })
-        return {"prompts": prompts}
+                "inputSchema": parameters or self._empty_object_schema(),
+                "categories": categories,
+            }
+        for prompt_name, (meta, _callable) in self._dynamic_prompts.items():
+            prompts_by_name[prompt_name] = dict(meta)
+        return {"prompts": self._sort_discovery_items(list(prompts_by_name.values()), "name")}
+
+    def register_prompt(
+        self,
+        name: str,
+        callable_: Any,
+        *,
+        description: str | None = None,
+        input_schema: dict[str, Any] | None = None,
+        categories: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        doc = description or (getdoc(callable_) or f"Prompt template {name}")
+        meta: dict[str, Any] = {
+            "name": name,
+            "description": doc,
+            "inputSchema": dict(input_schema) if input_schema else self._extract_parameters_from_signature(signature(callable_), callable_) or self._empty_object_schema(),
+            "categories": list(categories) if categories is not None else self._extract_prompt_categories(doc),
+        }
+        self._dynamic_prompts[name] = (meta, callable_)
+
+    async def register_prompt_and_notify(self, name: str, callable_: Any, **kwargs: Any) -> None:
+        """Register a prompt and immediately emit ``prompts/list_changed``."""
+        self.register_prompt(name, callable_, **kwargs)
+        await self.notify_prompt_list_changed()
+
+    def unregister_prompt(self, name: str) -> bool:
+        return self._dynamic_prompts.pop(name, None) is not None
+
+    async def unregister_prompt_and_notify(self, name: str) -> bool:
+        """Unregister a prompt and emit ``prompts/list_changed`` only on success."""
+        removed = self.unregister_prompt(name)
+        if removed:
+            await self.notify_prompt_list_changed()
+        return removed
 
     def _extract_prompt_categories(self, doc: str) -> list[str]:
         """Extract categories from a docstring.
@@ -301,6 +484,169 @@ class AsyncMCPServer:
                 out.append(c)
         return out
 
+    def _has_completion_support(self) -> bool:
+        return bool(
+            self._completion_providers
+            or self.discover_prompts()["prompts"]
+            or self.discover_resource_templates()["resourceTemplates"]
+        )
+
+    def register_completion_provider(self, ref_type: str, ref_name: str, argument_name: str, callable_: Any) -> None:
+        self._completion_providers[(ref_type, ref_name, argument_name)] = callable_
+
+    def _completion_parameter_schema(self, method: Any, argument_name: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        if isinstance(meta, dict):
+            input_schema = meta.get("inputSchema")
+            if isinstance(input_schema, dict):
+                properties = input_schema.get("properties")
+                if isinstance(properties, dict):
+                    schema = properties.get(argument_name)
+                    if isinstance(schema, dict):
+                        return schema
+        override = getattr(method, "_mcp_resource_template", None) or getattr(method, "_mcp_prompt", None) or {}
+        input_schema = override.get("input_schema")
+        if isinstance(input_schema, dict):
+            properties = input_schema.get("properties")
+            if isinstance(properties, dict):
+                schema = properties.get(argument_name)
+                if isinstance(schema, dict):
+                    return schema
+        return self._extract_parameters_from_signature(signature(method), method).get("properties", {}).get(argument_name, {})
+
+    def _resolve_completion_target(self, ref: dict[str, Any]) -> tuple[str, str, Any, dict[str, Any]]:
+        ref_type = ref.get("type")
+        if ref_type == "ref/prompt":
+            name = ref.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError("Invalid completion ref: prompt name is required")
+            if name in self._dynamic_prompts:
+                meta, method = self._dynamic_prompts[name]
+                return ref_type, name, method, dict(meta)
+            method_name = f"prompt_{name}"
+            if hasattr(self, method_name):
+                method = getattr(self, method_name)
+                return ref_type, name, method, {"name": name}
+            raise ValueError(f"Unknown prompt ref: {name}")
+        if ref_type == "ref/resource":
+            ref_name = ref.get("uri") or ref.get("uriTemplate") or ref.get("name")
+            if not isinstance(ref_name, str) or not ref_name:
+                raise ValueError("Invalid completion ref: resource template identifier is required")
+            for name, method, params in self._iter_resource_template_methods():
+                meta = self._resource_metadata(name, method, params=params)
+                if ref_name in {meta.get("name"), meta.get("uriTemplate")}:
+                    return ref_type, str(meta.get("uriTemplate")), method, meta
+            for meta, method in self._dynamic_resource_templates:
+                if ref_name in {meta.get("name"), meta.get("uriTemplate")}:
+                    return ref_type, str(meta.get("uriTemplate")), method, dict(meta)
+            raise ValueError(f"Unknown resource template ref: {ref_name}")
+        raise ValueError("Invalid completion ref: unsupported ref type")
+
+    def _enum_completion_values(self, method: Any, argument_name: str) -> list[str]:
+        try:
+            type_hints = get_type_hints(method)
+        except (NameError, AttributeError, TypeError):
+            type_hints = {}
+        annotation = type_hints.get(argument_name, signature(method).parameters.get(argument_name, Parameter("x", Parameter.POSITIONAL_OR_KEYWORD)).annotation)
+        schema = self._type_to_json_schema(annotation)
+        if not isinstance(schema, dict):
+            return []
+        values = schema.get("enum") if isinstance(schema.get("enum"), list) else []
+        return [str(value) for value in values]
+
+    def _schema_enum_completion_values(self, schema: dict[str, Any]) -> list[str]:
+        values = schema.get("enum") if isinstance(schema.get("enum"), list) else []
+        return [str(value) for value in values]
+
+    def _normalise_completion_result(self, raw: Any) -> tuple[list[str], int | None, bool | None]:
+        if isinstance(raw, dict):
+            values = raw.get("values", [])
+            total = raw.get("total")
+            has_more = raw.get("hasMore")
+        else:
+            values = raw
+            total = None
+            has_more = None
+        if not isinstance(values, list):
+            raise ValueError("Completion provider must return a list or {'values': [...]} result")
+        out: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            text = str(value)
+            if text not in seen:
+                seen.add(text)
+                out.append(text)
+        if total is not None and (not isinstance(total, int) or isinstance(total, bool) or total < 0):
+            raise ValueError("Completion provider returned invalid total")
+        if has_more is not None and not isinstance(has_more, bool):
+            raise ValueError("Completion provider returned invalid hasMore")
+        return out, total, has_more
+
+    async def handle_completion_complete_async(self, request_id: str | int | None, params: dict[str, Any]) -> dict[str, Any]:
+        ref = params.get("ref")
+        argument = params.get("argument")
+        context = params.get("context") or {}
+        requested = params.get("maxValues", self.max_completion_values)
+        if not isinstance(ref, dict):
+            return self.create_response(request_id, None, self.create_error(-32602, "Invalid params: 'ref' must be an object"))
+        if not isinstance(argument, dict):
+            return self.create_response(request_id, None, self.create_error(-32602, "Invalid params: 'argument' must be an object"))
+        if not isinstance(context, dict):
+            return self.create_response(request_id, None, self.create_error(-32602, "Invalid params: 'context' must be an object"))
+        if not isinstance(requested, int) or isinstance(requested, bool) or requested <= 0:
+            return self.create_response(request_id, None, self.create_error(-32602, "Invalid params: 'maxValues' must be a positive integer"))
+        argument_name = argument.get("name")
+        if not isinstance(argument_name, str) or not argument_name:
+            return self.create_response(request_id, None, self.create_error(-32602, "Invalid params: 'argument.name' must be a non-empty string"))
+        prefix = argument.get("value", "")
+        if prefix is None:
+            prefix = ""
+        if not isinstance(prefix, str):
+            prefix = str(prefix)
+        context_arguments = context.get("arguments", {}) or {}
+        if not isinstance(context_arguments, dict):
+            return self.create_response(request_id, None, self.create_error(-32602, "Invalid params: 'context.arguments' must be an object"))
+        try:
+            ref_type, ref_name, method, meta = self._resolve_completion_target(ref)
+        except ValueError as exc:
+            return self.create_response(request_id, None, self.create_error(-32602, str(exc)))
+        if argument_name not in signature(method).parameters:
+            return self.create_response(request_id, None, self.create_error(-32602, f"Unknown completion argument: {argument_name}"))
+
+        values = self._schema_enum_completion_values(self._completion_parameter_schema(method, argument_name, meta))
+        if not values:
+            values = self._enum_completion_values(method, argument_name)
+        provider = self._completion_providers.get((ref_type, ref_name, argument_name))
+        if provider is not None:
+            try:
+                raw = provider(prefix=prefix, arguments=dict(context_arguments), ref=dict(ref), argument=dict(argument))
+                if isawaitable(raw):
+                    raw = await raw
+                provided_values, provided_total, provided_has_more = self._normalise_completion_result(raw)
+            except ValueError as exc:
+                return self.create_response(request_id, None, self.create_error(-32602, str(exc)))
+            except Exception:  # noqa: BLE001
+                return self.create_response(request_id, None, self.create_error(-32603, "Completion provider failed"))
+            values.extend(provided_values)
+        else:
+            provided_total = None
+            provided_has_more = None
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if prefix and not value.startswith(prefix):
+                continue
+            if value not in seen:
+                seen.add(value)
+                deduped.append(value)
+        limit = min(requested, self.max_completion_values)
+        total = max(provided_total or 0, len(deduped)) if provided_total is not None else len(deduped)
+        has_more = provided_has_more if provided_has_more is not None else total > len(deduped[:limit])
+        result: dict[str, Any] = {"completion": {"values": deduped[:limit], "hasMore": has_more}}
+        if total != len(result["completion"]["values"]) or has_more:
+            result["completion"]["total"] = total
+        return self.create_response(request_id, result)
+
     async def handle_prompt_get_async(self, request_id: str | int | None, params: dict[str, Any]) -> dict[str, Any]:
         """Async handler for ``prompts/get`` supporting sync or async methods."""
         prompt_name = params.get('name')
@@ -308,11 +654,14 @@ class AsyncMCPServer:
             error = self.create_error(-32602, "Missing required parameter 'name'")
             return self.create_response(request_id, None, error)
         method_name = f"prompt_{prompt_name}"
-        if not hasattr(self, method_name):
+        if prompt_name in self._dynamic_prompts:
+            _meta, method = self._dynamic_prompts[prompt_name]
+        elif hasattr(self, method_name):
+            method = getattr(self, method_name)
+        else:
             error = self.create_error(-32601, f"Prompt not found: {prompt_name}")
             return self.create_response(request_id, None, error)
 
-        method = getattr(self, method_name)
         sig = signature(method)
         doc = getdoc(method) or f"Prompt template {prompt_name}"
         arguments = params.get('arguments', {}) or {}
@@ -358,6 +707,8 @@ class AsyncMCPServer:
             else:
                 ctx = copy_context()
                 ret = await get_event_loop().run_in_executor(None, lambda: ctx.run(method, **kwargs))
+        except (MCPRequestCancelled, CancelledError):
+            raise
         except Exception as e:  # noqa: BLE001
             message = self._remote_safe_failure("Prompt execution failed", f"Prompt execution error: {e}")
             error = self.create_error(-32603, message)
@@ -494,11 +845,26 @@ class AsyncMCPServer:
 
         return schema
 
+    def _tool_output_schema(self, method: Any) -> dict[str, Any] | None:
+        explicit = getattr(method, "_mcp_output_schema", None)
+        if explicit is not None:
+            return dict(explicit)
+        try:
+            type_hints = get_type_hints(method)
+        except (NameError, AttributeError, TypeError):
+            type_hints = {}
+        return_type = type_hints.get("return", signature(method).return_annotation)
+        if return_type in (Parameter.empty, Signature.empty, Any):
+            return None
+        return self._type_to_json_schema(return_type)
+
     def _type_to_json_schema(self, param_type: Any) -> dict[str, Any]:
         """Convert Python type annotation to JSON schema property."""
         # Untyped parameter (no annotation) -> default to string for MCP clients.
         if param_type is Parameter.empty:
             return {"type": "string"}
+        if param_type is Any:
+            return {}
         if param_type is None or param_type is type(None):
             return {"type": "null"}
         elif param_type is str:
@@ -527,6 +893,14 @@ class AsyncMCPServer:
                 return {"type": "integer", "enum": values}
             return {"enum": values}
 
+        if isinstance(param_type, type) and issubclass(param_type, Enum):
+            values = [member.value for member in param_type]
+            if all(isinstance(v, str) for v in values):
+                return {"type": "string", "enum": values}
+            if all(isinstance(v, int) for v in values):
+                return {"type": "integer", "enum": values}
+            return {"enum": values}
+
         # Handle Union types (e.g., Optional[str], str | None, str | int | None)
         is_union = isinstance(param_type, UnionType) or origin is Union
         if is_union:
@@ -546,7 +920,10 @@ class AsyncMCPServer:
                 schema["items"] = self._type_to_json_schema(args[0])
             return schema
         elif origin is dict:
-            return {"type": "object"}
+            schema = {"type": "object"}
+            if len(args) == 2:
+                schema["additionalProperties"] = self._type_to_json_schema(args[1])
+            return schema
 
         # Handle TypedDict classes → JSON Schema with typed properties
         try:
@@ -563,8 +940,127 @@ class AsyncMCPServer:
         except TypeError:
             pass
 
+        if isinstance(param_type, type) and is_dataclass(param_type):
+            dc_props = {}
+            dc_required = []
+            dc_hints = get_type_hints(param_type)
+            for field in fields(param_type):
+                dc_props[field.name] = self._type_to_json_schema(dc_hints.get(field.name, field.type))
+                if field.default is MISSING and field.default_factory is MISSING:
+                    dc_required.append(field.name)
+            dc_schema: dict[str, Any] = {"type": "object", "properties": dc_props, "additionalProperties": False}
+            if dc_required:
+                dc_schema["required"] = dc_required
+            return dc_schema
+
         # Default to string for unknown types
         return {"type": "string"}
+
+    def _normalise_structured_tool_value(self, value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if is_dataclass(value):
+            return {k: self._normalise_structured_tool_value(v) for k, v in asdict(value).items()}
+        if isinstance(value, Mapping):
+            return {str(k): self._normalise_structured_tool_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._normalise_structured_tool_value(item) for item in value]
+        return _STRUCTURED_UNSET
+
+    def _validate_schema_subset(self, value: Any, schema: dict[str, Any], path: str = "$") -> None:
+        if not schema:
+            return
+        if "enum" in schema and value not in schema["enum"]:
+            raise ValueError(f"{path} must be one of {schema['enum']}")
+        for branch_key in ("oneOf", "anyOf"):
+            branches = schema.get(branch_key)
+            if isinstance(branches, list) and branches:
+                errors = []
+                for branch in branches:
+                    try:
+                        self._validate_schema_subset(value, branch, path)
+                        return
+                    except ValueError as exc:
+                        errors.append(str(exc))
+                raise ValueError(errors[0])
+        expected_type = schema.get("type")
+        if isinstance(expected_type, list):
+            errors = []
+            for item_type in expected_type:
+                try:
+                    self._validate_schema_subset(value, {**schema, "type": item_type}, path)
+                    return
+                except ValueError as exc:
+                    errors.append(str(exc))
+            raise ValueError(errors[0])
+        if expected_type == "null":
+            if value is not None:
+                raise ValueError(f"{path} must be null")
+            return
+        if expected_type == "string":
+            if not isinstance(value, str):
+                raise ValueError(f"{path} must be a string")
+            return
+        if expected_type == "integer":
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{path} must be an integer")
+            return
+        if expected_type == "number":
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"{path} must be a number")
+            return
+        if expected_type == "boolean":
+            if not isinstance(value, bool):
+                raise ValueError(f"{path} must be a boolean")
+            return
+        if expected_type == "array":
+            if not isinstance(value, list):
+                raise ValueError(f"{path} must be an array")
+            item_schema = schema.get("items")
+            if isinstance(item_schema, dict):
+                for index, item in enumerate(value):
+                    self._validate_schema_subset(item, item_schema, f"{path}[{index}]")
+            return
+        if expected_type == "object" or "properties" in schema or "required" in schema:
+            if not isinstance(value, dict):
+                raise ValueError(f"{path} must be an object")
+            properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+            required = schema.get("required") if isinstance(schema.get("required"), list) else []
+            for key in required:
+                if key not in value:
+                    raise ValueError(f"{path}.{key} is required")
+            additional = schema.get("additionalProperties", True)
+            for key, item in value.items():
+                if key in properties:
+                    self._validate_schema_subset(item, properties[key], f"{path}.{key}")
+                elif additional is False:
+                    raise ValueError(f"{path}.{key} is not allowed")
+                elif isinstance(additional, dict):
+                    self._validate_schema_subset(item, additional, f"{path}.{key}")
+            return
+
+    def _format_tool_result(self, method: Any, content: Any, output_schema: dict[str, Any] | None = None) -> dict[str, Any]:
+        output_schema = dict(output_schema) if output_schema is not None else self._tool_output_schema(method)
+        structured = self._normalise_structured_tool_value(content)
+        if output_schema is not None:
+            candidate = structured if structured is not _STRUCTURED_UNSET else content
+            self._validate_schema_subset(candidate, output_schema)
+        if isinstance(content, str):
+            stringified_content = content
+        else:
+            try:
+                stringified_content = dumps(structured if structured is not _STRUCTURED_UNSET else content, ensure_ascii=False)
+            except TypeError:
+                stringified_content = str(content)
+        result = {
+            "content": [{
+                "type": "text",
+                "text": stringified_content
+            }]
+        }
+        if structured is not _STRUCTURED_UNSET and (isinstance(structured, dict) or (output_schema is not None and not isinstance(content, str))):
+            result["structuredContent"] = structured
+        return result
 
     def _coerce_value(self, value: Any, param_type: Any) -> Any:
         """Coerce a value to the expected type if needed.
@@ -709,7 +1205,7 @@ class AsyncMCPServer:
             resources.append(self._resource_metadata(name, method, params=[]))
         for meta, _callable in self._dynamic_resources.values():
             resources.append(dict(meta))
-        return {"resources": resources}
+        return {"resources": self._sort_discovery_items(resources, "name", "uri")}
 
     def discover_resource_templates(self) -> dict[str, Any]:
         """Return the ``resources/templates/list`` payload."""
@@ -718,7 +1214,7 @@ class AsyncMCPServer:
             templates.append(self._resource_metadata(name, method, params=params))
         for meta, _callable in self._dynamic_resource_templates:
             templates.append(dict(meta))
-        return {"resourceTemplates": templates}
+        return {"resourceTemplates": self._sort_discovery_items(templates, "name", "uriTemplate")}
 
     def register_resource(
         self,
@@ -810,12 +1306,32 @@ class AsyncMCPServer:
     def handle_resources_list(
         self, request_id: int | str | None, params: dict[str, Any]
     ) -> dict[str, Any]:
-        return self.create_response(request_id, self.discover_resources())
+        try:
+            result = self._page_list(
+                label="resources",
+                items=self.discover_resources()["resources"],
+                result_key="resources",
+                identity_keys=("uri", "name"),
+                params=params,
+            )
+        except ValueError as exc:
+            return self.create_response(request_id, None, self.create_error(-32602, str(exc)))
+        return self.create_response(request_id, result)
 
     def handle_resources_templates_list(
         self, request_id: int | str | None, params: dict[str, Any]
     ) -> dict[str, Any]:
-        return self.create_response(request_id, self.discover_resource_templates())
+        try:
+            result = self._page_list(
+                label="resourceTemplates",
+                items=self.discover_resource_templates()["resourceTemplates"],
+                result_key="resourceTemplates",
+                identity_keys=("uriTemplate", "name"),
+                params=params,
+            )
+        except ValueError as exc:
+            return self.create_response(request_id, None, self.create_error(-32602, str(exc)))
+        return self.create_response(request_id, result)
 
     async def _maybe_await(self, value: Any) -> Any:
         if iscoroutinefunction(getattr(value, "__call__", None)):  # safety
@@ -844,6 +1360,8 @@ class AsyncMCPServer:
             if meta["uri"] == uri:
                 try:
                     value = await call(method)
+                except (MCPRequestCancelled, CancelledError):
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     self.logger.exception("Resource %s raised", uri)
                     return self.create_response(
@@ -860,6 +1378,8 @@ class AsyncMCPServer:
             meta, fn = self._dynamic_resources[uri]
             try:
                 value = await call(fn)
+            except (MCPRequestCancelled, CancelledError):
+                raise
             except Exception as exc:  # noqa: BLE001
                 self.logger.exception("Resource %s raised", uri)
                 return self.create_response(
@@ -879,6 +1399,8 @@ class AsyncMCPServer:
             if m:
                 try:
                     value = await call(method, **m.groupdict())
+                except (MCPRequestCancelled, CancelledError):
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     self.logger.exception("Resource template %s raised", uri)
                     return self.create_response(
@@ -897,6 +1419,8 @@ class AsyncMCPServer:
             if m:
                 try:
                     value = await call(fn, **m.groupdict())
+                except (MCPRequestCancelled, CancelledError):
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     self.logger.exception("Resource template %s raised", uri)
                     return self.create_response(
@@ -971,7 +1495,7 @@ class AsyncMCPServer:
             target_items = list(self._sse_sessions.items())
             if session_ids is not None:
                 target_items = [item for item in target_items if item[0] in session_ids]
-            for sid, (writer, _evt, write_lock) in target_items:
+            for sid, (writer, _evt, write_lock, _owner) in target_items:
                 try:
                     async with write_lock:
                         writer.write(sse_blob)
@@ -985,6 +1509,14 @@ class AsyncMCPServer:
             _stdout_bin.flush()
         except Exception:  # noqa: BLE001
             self.logger.exception("Failed to emit notification %s", method)
+
+    async def notify_tool_list_changed(self) -> None:
+        """Tell connected clients the tool list has changed."""
+        await self._send_notification_async("notifications/tools/list_changed")
+
+    async def notify_prompt_list_changed(self) -> None:
+        """Tell connected clients the prompt list has changed."""
+        await self._send_notification_async("notifications/prompts/list_changed")
 
     async def notify_resource_list_changed(self) -> None:
         """Tell connected clients the resource list has changed."""
@@ -1006,9 +1538,48 @@ class AsyncMCPServer:
                 "notifications/resources/updated", {"uri": uri},
             )
 
+    _LOG_LEVELS = ("debug", "info", "notice", "warning", "error", "critical", "alert", "emergency")
+    _SECRET_KEY_PATTERN = re.compile(r"(?:pass(word)?|secret|token|api[_-]?key|auth(orization)?|cookie|session|credential)", re.IGNORECASE)
+    _SECRET_VALUE_PATTERN = re.compile(r"(?i)(bearer\s+[A-Za-z0-9._~+/=-]+|sk-[A-Za-z0-9]+|api[_-]?key\s*[:=]\s*\S+|token\s*[:=]\s*\S+)")
+
+    def _should_emit_log_message(self, level: str) -> bool:
+        return self._LOG_LEVELS.index(level) >= self._LOG_LEVELS.index(self.logging_level)
+
+    def _sanitize_log_data(self, data: Any) -> Any:
+        if isinstance(data, dict):
+            return {
+                str(key): ("[redacted]" if self._SECRET_KEY_PATTERN.search(str(key)) else self._sanitize_log_data(value))
+                for key, value in data.items()
+            }
+        if isinstance(data, list):
+            return [self._sanitize_log_data(item) for item in data]
+        if isinstance(data, tuple):
+            return [self._sanitize_log_data(item) for item in data]
+        if isinstance(data, str):
+            return self._SECRET_VALUE_PATTERN.sub("[redacted]", data)
+        return data
+
+    def handle_logging_set_level(self, request_id: str | int | None, params: dict[str, Any]) -> dict[str, Any]:
+        level = params.get("level")
+        if not isinstance(level, str) or level not in self._LOG_LEVELS:
+            return self.create_response(request_id, None, self.create_error(-32602, "Invalid params: 'level' must be one of debug, info, notice, warning, error, critical, alert, emergency"))
+        self.logging_level = level
+        return self.create_response(request_id, {})
+
+    async def notify_log_message(self, level: str, data: Any, *, logger: str | None = None, sanitize: bool = True) -> None:
+        if level not in self._LOG_LEVELS or not self._should_emit_log_message(level):
+            return
+        params: dict[str, Any] = {"level": level, "data": self._sanitize_log_data(data) if sanitize else data}
+        if logger:
+            params["logger"] = logger
+        await self._send_notification_async("notifications/message", params)
+
+    async def log_message(self, level: str, data: Any, *, logger: str | None = None, sanitize: bool = True) -> None:
+        await self.notify_log_message(level, data, logger=logger, sanitize=sanitize)
+
     # ==== Protocol handlers ====
 
-    def handle_initialize(self, request_id: int, params: dict[str, Any]) -> dict[str, Any]:
+    def handle_initialize(self, request_id: str | int | None, params: dict[str, Any]) -> dict[str, Any]:
         """Handle initialize request."""
         config = self.get_config()
         config["protocolVersion"] = exact_or_fallback(
@@ -1016,10 +1587,19 @@ class AsyncMCPServer:
         )
         return self.create_response(request_id, config)
 
-    def handle_tools_list(self, request_id: int) -> dict[str, Any]:
-        """Handle tools/list request."""
-        tools_info = self.discover_tools()
-        return self.create_response(request_id, tools_info)
+    def handle_tools_list(self, request_id: str | int | None, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle tools/list request with optional cursor pagination."""
+        try:
+            result = self._page_list(
+                label="tools",
+                items=self.discover_tools()["tools"],
+                result_key="tools",
+                identity_keys=("name",),
+                params=params,
+            )
+        except ValueError as exc:
+            return self.create_response(request_id, None, self.create_error(-32602, str(exc)))
+        return self.create_response(request_id, result)
 
     async def handle_tools_call_async(self, request_id: int, params: dict[str, Any]) -> dict[str, Any]:
         """Handle ``tools/call`` asynchronously."""
@@ -1035,7 +1615,14 @@ class AsyncMCPServer:
             return self.create_response(request_id, None, error)
 
         method_name = f"tool_{tool_name}"
-        method = getattr(self, method_name, None)
+        output_schema: dict[str, Any] | None = None
+        if tool_name in self._dynamic_tools:
+            meta, method = self._dynamic_tools[tool_name]
+            raw_output_schema = meta.get("outputSchema")
+            if isinstance(raw_output_schema, dict):
+                output_schema = raw_output_schema
+        else:
+            method = getattr(self, method_name, None)
         if not method or not callable(method):
             error = self.create_error(-32601, f"Tool not found: {tool_name}")
             return self.create_response(request_id, None, error)
@@ -1097,6 +1684,8 @@ class AsyncMCPServer:
                     )
         except ValueError as e:
             return self.create_response(request_id, None, self.create_error(-32602, str(e)))
+        except (MCPRequestCancelled, CancelledError):
+            raise
         except Exception as e:
             tb = traceback.format_exc()
             self.logger.error("TOOL ERROR: %s failed with %s: %s\n%s", tool_name, type(e).__name__, e, tb)
@@ -1109,20 +1698,14 @@ class AsyncMCPServer:
 
         self.logger.info("TOOL SUCCESS: %s returned type: %s", tool_name, type(content).__name__)
 
-        if isinstance(content, str):
-            stringified_content = content
-        else:
-            try:
-                stringified_content = dumps(content, ensure_ascii=False)
-            except TypeError:
-                stringified_content = str(content)
-
-        result = {
-            "content": [{
-                "type": "text",
-                "text": stringified_content
-            }]
-        }
+        try:
+            result = self._format_tool_result(method, content, output_schema=output_schema)
+        except ValueError as exc:
+            message = self._remote_safe_failure(
+                "Tool output validation failed",
+                f"Tool output validation failed for {tool_name}: {exc}",
+            )
+            return self.create_response(request_id, None, self.create_error(-32603, message))
 
         return self.create_response(request_id, result)
 
@@ -1177,13 +1760,23 @@ class AsyncMCPServer:
     def authenticate(self, headers: Mapping[str, str], peer: Any) -> MCPPrincipal | None:
         request_hook = type(self).authenticate_request
         if request_hook is not AsyncMCPServer.authenticate_request:
-            return request_hook(self, method="", path="", headers=headers, peer=str(peer) if peer is not None else None)
+            result = request_hook(self, method="", path="", headers=headers, peer=str(peer) if peer is not None else None)
+            if isawaitable(result):
+                close = getattr(result, "close", None)
+                if close: close()
+                raise TypeError("async authentication hook requires authenticate_async()")
+            return result
         return MCPPrincipal(name="anonymous")
 
     def authorize(self, principal: MCPPrincipal | None, method: str | None, params: Mapping[str, Any]) -> bool:
         request_hook = type(self).authorize_request
         if request_hook is not AsyncMCPServer.authorize_request:
-            return request_hook(self, principal, rpc_method=method, tool_name=(params.get("name") if isinstance(params, Mapping) else None))
+            result = request_hook(self, principal, rpc_method=method, tool_name=(params.get("name") if isinstance(params, Mapping) else None))
+            if isawaitable(result):
+                close = getattr(result, "close", None)
+                if close: close()
+                raise TypeError("async authorization hook requires authorize_async()")
+            return result
         return True
 
     async def authenticate_request_async(self, *, method: str, path: str, headers: Mapping[str, str], peer: str | None) -> MCPPrincipal | None:
@@ -1195,15 +1788,107 @@ class AsyncMCPServer:
         return await result if isawaitable(result) else result
 
     async def authenticate_async(self, headers: Mapping[str, str], peer: Any) -> MCPPrincipal | None:
-        result = self.authenticate(headers, peer)
+        result = self.authenticate_request(
+            method="", path="", headers=headers,
+            peer=str(peer) if peer is not None else None,
+        )
         return await result if isawaitable(result) else result
 
     async def authorize_async(self, principal: MCPPrincipal | None, method: str | None, params: Mapping[str, Any]) -> bool:
-        result = self.authorize(principal, method, params)
+        result = self.authorize_request(
+            principal, rpc_method=method,
+            tool_name=params.get("name") if isinstance(params, Mapping) else None,
+        )
         return await result if isawaitable(result) else result
 
-    def _with_request_context(self, *, transport: str | None, request_id: str | int | None, principal: str | None, peer: str | None, headers: dict[str, str], version: str | None, session_id: str | None = None):
-        return set_request_context(MCPRequestContext(transport=transport, request_id=request_id, protocol_version=version, session_id=session_id, principal=principal, peer=peer, headers=headers))
+    def _with_request_context(self, *, transport: str | None, request_id: str | int | None, principal: str | None, peer: str | None, headers: dict[str, str], version: str | None, session_id: str | None = None, progress_token: str | int | None = None):
+        return set_request_context(MCPRequestContext(transport=transport, request_id=request_id, progress_token=progress_token, protocol_version=version, session_id=session_id, principal=principal, peer=peer, headers=headers))
+
+    @staticmethod
+    def _validate_progress_token(value: Any) -> str | int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise ValueError("Invalid params: '_meta.progressToken' must be a string or integer")
+        return value
+
+    @staticmethod
+    def _validate_progress_value(name: str, value: float | int) -> float | int:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"Invalid progress notification: '{name}' must be a finite non-negative number")
+        return value
+
+    @staticmethod
+    def _sanitize_progress_message(message: str | None) -> str | None:
+        if message is None:
+            return None
+        text = str(message).replace("\x00", "")
+        return text[:4096]
+
+    async def _register_request_cancellation(self, request_id: str | int | None, progress_token: str | int | None) -> tuple[MCPCancellationState, dict[str, Any]]:
+        state = MCPCancellationState()
+        entry = {"state": state, "task": current_task(), "progress_token": progress_token}
+        async with self._request_registry_lock:
+            if request_id is not None:
+                self._active_requests_by_id[request_id] = entry
+            if progress_token is not None and request_id is not None:
+                self._active_requests_by_progress_token.setdefault(progress_token, set()).add(request_id)
+        return state, entry
+
+    async def _cleanup_request_cancellation(self, request_id: str | int | None, progress_token: str | int | None, entry: dict[str, Any]) -> None:
+        async with self._request_registry_lock:
+            if request_id is not None and self._active_requests_by_id.get(request_id) is entry:
+                self._active_requests_by_id.pop(request_id, None)
+            if progress_token is not None and request_id is not None:
+                request_ids = self._active_requests_by_progress_token.get(progress_token)
+                if request_ids is not None:
+                    request_ids.discard(request_id)
+                    if not request_ids:
+                        self._active_requests_by_progress_token.pop(progress_token, None)
+
+    async def _mark_request_cancelled(self, cancel_key: str | int | None) -> None:
+        if cancel_key is None or isinstance(cancel_key, bool) or not isinstance(cancel_key, (str, int)):
+            return
+        async with self._request_registry_lock:
+            entries: list[dict[str, Any]] = []
+            direct = self._active_requests_by_id.get(cancel_key)
+            if direct is not None:
+                entries.append(direct)
+            for request_id in self._active_requests_by_progress_token.get(cancel_key, ()):
+                entry = self._active_requests_by_id.get(request_id)
+                if entry is not None and entry not in entries:
+                    entries.append(entry)
+        for entry in entries:
+            state = entry["state"]
+            state.mark_cancelled()
+            task = entry.get("task")
+            if task is not None and not task.done():
+                task.cancel()
+
+    def get_progress_token(self) -> str | int | None:
+        return _get_progress_token()
+
+    def is_request_cancelled(self) -> bool:
+        return _is_request_cancelled()
+
+    def raise_if_cancelled(self) -> None:
+        _raise_if_cancelled()
+
+    async def notify_progress(self, progress: float | int, total: float | int | None = None, message: str | None = None) -> None:
+        token = self.get_progress_token()
+        if token is None:
+            return
+        progress = self._validate_progress_value("progress", progress)
+        params: dict[str, Any] = {"progressToken": token, "progress": progress}
+        if total is not None:
+            total = self._validate_progress_value("total", total)
+            if total < progress:
+                raise ValueError("Invalid progress notification: 'total' must be greater than or equal to 'progress'")
+            params["total"] = total
+        sanitized = self._sanitize_progress_message(message)
+        if sanitized:
+            params["message"] = sanitized
+        await self._send_notification_async("notifications/progress", params)
 
     def _validate_http_principal(self, principal: MCPPrincipal | None) -> bool:
         return principal is None or isinstance(principal, MCPPrincipal)
@@ -1241,40 +1926,76 @@ class AsyncMCPServer:
 
         self.logger.info("Processing method: %s (id: %s)", method, request_id)
 
+        meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else None
+        try:
+            progress_token = self._validate_progress_token(meta.get("progressToken") if meta else None)
+        except ValueError as exc:
+            return self.create_response(request_id, None, self.create_error(-32602, str(exc)))
+
         # Validate JSON-RPC 2.0 version
         if jsonrpc != "2.0":
             error = self.create_error(-32600, "Invalid Request: Not a JSON-RPC 2.0 request")
             return self.create_response(request_id, None, error)
+        if "id" in request and not is_valid_jsonrpc_id(request_id):
+            error = self.create_error(-32600, "Invalid Request: invalid id")
+            return self.create_response(None, None, error)
 
         if method is None and ("result" in request or "error" in request):
-            return None  # A client response is acknowledged by the transport.
+            valid_response = is_valid_jsonrpc_response(request)
+            if valid_response:
+                return None  # A client response is acknowledged by the transport.
+            error = self.create_error(-32600, "Invalid Request: malformed response")
+            return self.create_response(request_id, None, error)
         if not isinstance(method, str):
             error = self.create_error(-32600, "Invalid Request: method must be a string")
             return self.create_response(request_id, None, error)
 
         if context is None:
-            context = MCPRequestContext(request_id=request_id)
+            context = MCPRequestContext(request_id=request_id, progress_token=progress_token)
         else:
             context = MCPRequestContext(
                 transport=context.transport,
                 request_id=request_id,
+                progress_token=progress_token,
                 protocol_version=context.protocol_version,
                 session_id=context.session_id,
                 principal=context.principal,
                 peer=context.peer,
                 headers=context.headers,
             )
+        cancellation_state = None
+        registry_entry = None
+        if request_id is not None:
+            cancellation_state, registry_entry = await self._register_request_cancellation(request_id, progress_token)
+        runtime_token = set_request_runtime(MCPRequestRuntime(progress_token=progress_token, cancellation=cancellation_state, progress_callback=self.notify_progress))
         token = set_request_context(context)
         try:
             # Process the method
+            if method == "notifications/cancelled":
+                cancel_id = params.get("requestId")
+                if cancel_id is not None and not is_valid_jsonrpc_id(cancel_id):
+                    if request_id is None:
+                        return None
+                    return self.create_response(request_id, None, self.create_error(-32602, "Invalid params: 'requestId' must be a string, integer, or null"))
+                await self._mark_request_cancelled(cancel_id)
+                return None
             if method == "initialize":
                 return self.handle_initialize(request_id, params)
             elif method == "tools/list":
-                return self.handle_tools_list(request_id)
+                return self.handle_tools_list(request_id, params)
             elif method == "tools/call":
                 return await self.handle_tools_call_async(request_id, params)
             elif method == "prompts/list":
-                result = self.discover_prompts()
+                try:
+                    result = self._page_list(
+                        label="prompts",
+                        items=self.discover_prompts()["prompts"],
+                        result_key="prompts",
+                        identity_keys=("name",),
+                        params=params,
+                    )
+                except ValueError as exc:
+                    return self.create_response(request_id, None, self.create_error(-32602, str(exc)))
                 return self.create_response(request_id, result)
             elif method == "prompts/get":
                 return await self.handle_prompt_get_async(request_id, params)
@@ -1288,14 +2009,29 @@ class AsyncMCPServer:
                 return self.handle_resources_subscribe(request_id, params)
             elif method == "resources/unsubscribe":
                 return self.handle_resources_unsubscribe(request_id, params)
+            elif method == "completion/complete":
+                return await self.handle_completion_complete_async(request_id, params)
+            elif method == "logging/setLevel":
+                return self.handle_logging_set_level(request_id, params)
             elif method == "notifications/initialized":
                 self.logger.info("Host confirmed toolContract reception with 'notifications/initialized'")
                 return None
             else:
                 error = self.create_error(-32601, f"Method not found: {method}")
                 return self.create_response(request_id, None, error)
+        except MCPRequestCancelled:
+            if request_id is None:
+                return None
+            return self.create_response(request_id, None, self.create_error(-32800, "Request cancelled"))
+        except CancelledError:
+            if request_id is None:
+                raise
+            return self.create_response(request_id, None, self.create_error(-32800, "Request cancelled"))
         finally:
             reset_request_context(token)
+            reset_request_runtime(runtime_token)
+            if registry_entry is not None:
+                await self._cleanup_request_cancellation(request_id, progress_token, registry_entry)
 
     # ==== Main execution ====
 
@@ -1362,10 +2098,14 @@ class AsyncMCPServer:
         request_line = await wait_for(reader.readline(), timeout=30.0)
         if not request_line:
             raise ConnectionError("Client disconnected")
+        if len(request_line) > 8192:
+            raise ValueError("Request line too long")
         parts = request_line.decode("ascii", errors="strict").strip().split(" ")
         if len(parts) != 3:
             raise ValueError("Malformed request line")
         method, path, http_version = parts
+        if http_version not in {"HTTP/1.0", "HTTP/1.1"}:
+            raise ValueError("Unsupported HTTP version")
         headers: dict[str, str] = {}
         header_counts: dict[str, int] = {}
         header_bytes = 0
@@ -1384,8 +2124,11 @@ class AsyncMCPServer:
             header_counts[normalized] = header_counts.get(normalized, 0) + 1
         else:
             raise ValueError("too many headers")
-        if has_singleton_header_violations(header_counts, http_version=http_version):
-            raise ValueError("invalid duplicate header")
+        if (
+            has_singleton_header_violations(header_counts, http_version=http_version)
+            or has_ambiguous_singleton_values(headers)
+        ):
+            raise ValueError("invalid singleton header")
         try:
             content_length = int(headers.get("content-length", "0") or "0")
         except ValueError as exc:
@@ -1476,7 +2219,7 @@ class AsyncMCPServer:
                 self.logger.info("SSE: new session %s from %s", session_id, peer)
                 disconnect_event = Event()
                 write_lock = Lock()
-                self._sse_sessions[session_id] = (writer, disconnect_event, write_lock)
+                self._sse_sessions[session_id] = (writer, disconnect_event, write_lock, principal.name)
                 response = [b"HTTP/1.1 200 OK\r\n", b"Content-Type: text/event-stream\r\n", b"Cache-Control: no-cache\r\n", b"Connection: keep-alive\r\n"]
                 if allowed_origin:
                     response.append(f"Access-Control-Allow-Origin: {allowed_origin}\r\nVary: Origin\r\n".encode())
@@ -1512,10 +2255,6 @@ class AsyncMCPServer:
                     return
                 qs = parse_qs(path.split("?", 1)[1] if "?" in path else "")
                 session_id = (qs.get("sessionId") or [None])[0]
-                if not session_id or session_id not in self._sse_sessions:
-                    self.logger.warning("SSE: unknown session %s from %s", session_id, peer)
-                    await send_response("404 Not Found", origin=allowed_origin)
-                    return
                 try:
                     principal = await self.authenticate_request_async(method="POST", path=path, headers=headers, peer=peer[0] if peer else None)
                 except Exception:
@@ -1529,7 +2268,19 @@ class AsyncMCPServer:
                 if principal is None:
                     await send_response("401 Unauthorized", origin=allowed_origin, extra_headers=(("WWW-Authenticate", "Bearer"),))
                     return
-                request_data = body.decode("utf-8", errors="replace")
+                session = self._sse_sessions.get(session_id) if session_id else None
+                if session is None:
+                    self.logger.warning("SSE: unknown session %s from %s", session_id, peer)
+                    await send_response("404 Not Found", origin=allowed_origin)
+                    return
+                if session[3] != principal.name:
+                    await send_response("403 Forbidden", origin=allowed_origin)
+                    return
+                try:
+                    request_data = body.decode("utf-8")
+                except UnicodeDecodeError:
+                    await send_response("400 Bad Request", origin=allowed_origin)
+                    return
                 self.logger.info("SSE REQUEST (session %s): %s", session_id, request_data[:200])
                 try:
                     request_obj = loads(request_data)
@@ -1555,11 +2306,10 @@ class AsyncMCPServer:
                     request_obj["params"] = dict(params)
                     request_obj["params"]["_session_id"] = session_id
                     request_data = dumps(request_obj)
-                session = self._sse_sessions.get(session_id)
-                if session is None:
+                if self._sse_sessions.get(session_id) is not session:
                     await send_response("404 Not Found", origin=allowed_origin)
                     return
-                sse_writer, _disconnect_event, write_lock = session
+                sse_writer, _disconnect_event, write_lock, _owner = session
                 response = await self.process_request_async(request_data, context=MCPRequestContext(transport="sse", request_id=request_obj.get("id") if isinstance(request_obj, dict) else None, session_id=session_id, principal=principal.name if principal else None, peer=peer[0] if peer else None, headers=headers))
                 if response is not None:
                     response_json = dumps(response)
@@ -1630,6 +2380,8 @@ class AsyncMCPServer:
                 if not line or len(line) > 8192:
                     raise ValueError("invalid request line")
                 method, path, http_version = line.decode("ascii", errors="strict").strip().split(" ")
+                if http_version not in {"HTTP/1.0", "HTTP/1.1"}:
+                    raise ValueError("unsupported HTTP version")
                 headers: dict[str, str] = {}
                 header_counts: dict[str, int] = {}
                 header_bytes = 0
@@ -1656,7 +2408,10 @@ class AsyncMCPServer:
             if origin and not allowed_origin:
                 await send_response("403 Forbidden")
                 return
-            if has_singleton_header_violations(header_counts, http_version=http_version):
+            if (
+                has_singleton_header_violations(header_counts, http_version=http_version)
+                or has_ambiguous_singleton_values(headers)
+            ):
                 await send_response("400 Bad Request", origin=allowed_origin)
                 return
             if headers.get("transfer-encoding"):
@@ -1711,7 +2466,7 @@ class AsyncMCPServer:
                 return
             try:
                 req = loads(body.decode("utf-8"))
-            except JSONDecodeError:
+            except (UnicodeDecodeError, JSONDecodeError):
                 resp = self.create_response(None, None, self.create_error(-32700, "Parse error"))
                 await send_response("200 OK", body=(dumps(resp) + "\n").encode(), content_type="application/json", origin=allowed_origin)
                 return
@@ -1724,7 +2479,11 @@ class AsyncMCPServer:
             if rpc_method != "initialize" and version not in SUPPORTED_PROTOCOL_VERSIONS:
                 await send_response("400 Bad Request", origin=allowed_origin)
                 return
-            is_response = rpc_method is None and ("result" in req or "error" in req)
+            is_response = (
+                rpc_method is None
+                and "id" in req
+                and is_valid_jsonrpc_response(req)
+            )
             is_notification = rpc_method is not None and "id" not in req
             if is_response:
                 await send_response("202 Accepted", origin=allowed_origin)
@@ -1764,7 +2523,7 @@ class AsyncMCPServer:
 
     async def run_sse_async(self, host: str = "127.0.0.1", port: int = 0, allowed_origins: list[str] | None = None, max_request_bytes: int = 4 * 1024 * 1024) -> None:
         allowed_origins = allowed_origins or []
-        self._sse_sessions: dict[str, tuple[StreamWriter, Event, Lock]] = {}
+        self._sse_sessions: dict[str, tuple[StreamWriter, Event, Lock, str]] = {}
         server = await start_server(lambda r, w: self._sse_handle_client(r, w, allowed_origins, max_request_bytes, host), host, port)
         addrs = [s.getsockname() for s in server.sockets]
         for addr in addrs:

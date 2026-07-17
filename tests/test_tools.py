@@ -234,4 +234,4 @@ def test_async_initialize_includes_tools_capability() -> None:
     resp = asyncio.run(_Async().process_request_async(json.dumps({
         "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {},
     })))
-    assert "tools" in resp["result"]["capabilities"]
+    assert resp["result"]["capabilities"]["tools"] == {"listChanged": True}

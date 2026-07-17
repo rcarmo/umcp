@@ -345,6 +345,7 @@ def test_origin_validation_is_exact_and_remote_safe() -> None:
     assert origin_is_allowed("http://localhost:3000")
     assert not origin_is_allowed("http://127.0.0.1.evil.example")
     assert not origin_is_allowed("http://localhost:3000", local_bind=False)
+    assert not origin_is_allowed("http://localhost:3000", ["https://ui.example"])
     assert origin_is_allowed("https://ui.example", ["https://ui.example"], local_bind=False)
 
 
@@ -413,6 +414,10 @@ def test_async_auth_hook_aliases_and_new_hooks_are_bidirectional() -> None:
     assert asyncio.run(legacy.authorize_async(MCPPrincipal(name="legacy"), "tools/call", {"name": "ok"})) is True
 
     new = NewAuthAsync()
+    with pytest.raises(TypeError, match="authenticate_async"):
+        new.authenticate({"authorization": "Bearer new"}, ("127.0.0.1", 1))
+    with pytest.raises(TypeError, match="authorize_async"):
+        new.authorize(MCPPrincipal(name="new"), "tools/call", {"name": "ok"})
     assert asyncio.run(new.authenticate_async({"authorization": "Bearer new"}, ("127.0.0.1", 1))).name == "new"
     assert asyncio.run(new.authorize_async(MCPPrincipal(name="new"), "tools/call", {"name": "ok"})) is True
     assert asyncio.run(new.authorize_async(MCPPrincipal(name="new"), "tools/call", {"name": "forbidden"})) is False
@@ -566,6 +571,27 @@ def test_remote_transports_hide_internal_errors() -> None:
     assert async_resource["error"]["message"] == "Resource read failed"
 
 
+def test_async_http_rejects_invalid_utf8_version_and_ambiguous_host() -> None:
+    invalid_utf8 = (
+        "POST /mcp HTTP/1.1\nHost: x\nContent-Type: application/json\n"
+        "Accept: application/json\nAuthorization: Bearer ok\nContent-Length: 1"
+    )
+    wire = b"".join(asyncio.run(_run_async(AuthAsync(), invalid_utf8, b"\x80")).chunks)
+    assert b"200 OK" in wire and b'"code": -32700' in wire
+
+    bad_version = (
+        "POST /mcp HTTP/9.9\nHost: x\nContent-Type: application/json\n"
+        "Accept: application/json\nContent-Length: 0"
+    )
+    assert b"400 Bad Request" in b"".join(asyncio.run(_run_async(AuthAsync(), bad_version)).chunks)
+
+    comma_host = (
+        "POST /mcp HTTP/1.1\nHost: good, evil\nContent-Type: application/json\n"
+        "Accept: application/json\nContent-Length: 0"
+    )
+    assert b"400 Bad Request" in b"".join(asyncio.run(_run_async(AuthAsync(), comma_host)).chunks)
+
+
 def test_async_streamable_http_rejects_invalid_host_and_duplicate_singleton_headers() -> None:
     body = dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).encode()
     cases = [
@@ -615,6 +641,31 @@ def test_async_sse_origin_auth_media_and_body_rules() -> None:
     assert b"413 Payload Too Large" in too_big
 
 
+def test_async_sse_binds_sessions_to_authenticated_principal() -> None:
+    server = AuthAsync()
+    server._sse_sessions["s1"] = (Writer([]), asyncio.Event(), asyncio.Lock(), "bob")
+    body = dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
+    request = (
+        "POST /message?sessionId=s1 HTTP/1.1\nHost: x\n"
+        "Content-Type: application/json\nAccept: application/json\n"
+        f"Authorization: Bearer ok\nContent-Length: {len(body)}"
+    )
+    wire = b"".join(asyncio.run(_run_async_sse(server, request, body)).chunks)
+    assert b"403 Forbidden" in wire
+
+
+def test_async_sse_rejects_invalid_utf8_body() -> None:
+    server = AuthAsync()
+    server._sse_sessions["s1"] = (Writer([]), asyncio.Event(), asyncio.Lock(), "alice")
+    request = (
+        "POST /message?sessionId=s1 HTTP/1.1\nHost: x\n"
+        "Content-Type: application/json\nAccept: application/json\n"
+        "Authorization: Bearer ok\nContent-Length: 1"
+    )
+    wire = b"".join(asyncio.run(_run_async_sse(server, request, b"\xff")).chunks)
+    assert b"400 Bad Request" in wire
+
+
 def test_async_sse_session_cleanup_race_returns_404() -> None:
     class RaceServer(AuthAsync):
         def authorize_request(self, principal, *, rpc_method, tool_name):
@@ -622,7 +673,7 @@ def test_async_sse_session_cleanup_race_returns_404() -> None:
             return True
 
     server = RaceServer()
-    server._sse_sessions["s1"] = (Writer([]), asyncio.Event(), asyncio.Lock())
+    server._sse_sessions["s1"] = (Writer([]), asyncio.Event(), asyncio.Lock(), "alice")
     body = dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
     request = (
         "POST /message?sessionId=s1 HTTP/1.1\nHost: x\n"

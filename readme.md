@@ -47,6 +47,8 @@ with a handful of runnable examples in [`examples/`](examples/).
 - ✅ Full JSON-RPC 2.0 protocol over stdio, SSE, streamable HTTP, or TCP
 - ✅ Complete MCP protocol implementation (tools, prompts, **resources**, annotations)
 - ✅ Dynamic discovery via function naming convention (`tool_*`, `prompt_*`, `resource_*`, `resource_template_*`)
+- ✅ Runtime tool/prompt/resource registration with list-changed notifications
+- ✅ Stable sorted discovery with optional cursor pagination for list endpoints
 - ✅ Complete introspection of function signatures, including `Literal`, `Union`, and `TypedDict`
 - ✅ MCP `inputSchema` generated automatically from type hints
 - ✅ Automatic `readOnlyHint` / `destructiveHint` / `openWorldHint` annotations from naming conventions
@@ -119,6 +121,11 @@ The equivalent explicit form is `--transport stdio|streamable-http|sse|tcp`.
 Network transports also accept `--host`, `--endpoint`,
 `--max-request-bytes`, and repeatable `--allowed-origin` options. Conflicting
 aliases and network transports without `--port` are rejected.
+
+For compatibility with existing lightweight clients and command-line use,
+the dispatcher does not keep a connection-level "initialized" flag; it will
+answer methods such as `tools/list` before `initialize`. Standards-compliant
+MCP clients should still perform the normal initialize handshake.
 
 Streamable HTTP accepts one JSON-RPC object per `POST`. Requests return
 `200 application/json`; notifications and client responses return `202`.
@@ -286,7 +293,12 @@ example for what a production deployment of `umcp` looks like.
 
 `umcp` supports reusable prompt templates using the same naming
 convention as tools: methods named `prompt_<name>` are discovered and
-exposed via the MCP `prompts/list` and `prompts/get` methods. See
+exposed via the MCP `prompts/list` and `prompts/get` methods. You can
+also register prompts at runtime with `register_prompt()` /
+`unregister_prompt()`, or use `register_prompt_and_notify()` /
+`unregister_prompt_and_notify()` as convenience wrappers. The plain
+register/unregister APIs only mutate local state; if you use them
+directly, you must call `notify_prompt_list_changed()` yourself. See
 [`docs/PROMPTS.md`](docs/PROMPTS.md) for the full reference.
 
 Quick example:
@@ -304,6 +316,42 @@ echo '{"jsonrpc": "2.0", "method": "prompts/list", "id": 1}' | python ./examples
 echo '{"jsonrpc": "2.0", "method": "prompts/get", "params": {"name": "code_review", "arguments": {"filename": "main.py"}}, "id": 2}' | python ./examples/movie_server.py
 ```
 
+### Completions and runtime logging
+
+`umcp` also exposes MCP `completion/complete` and `logging/setLevel`.
+`initialize` always advertises `logging: {}` and only adds
+`completions: {}` when the server actually has something completable
+(prompt arguments, resource-template arguments, or registered completion
+providers).
+
+Completion values can come from:
+
+* `Literal[...]` annotations
+* `Enum` annotations
+* prompt `inputSchema` enums supplied to `register_prompt()`
+* registered completion providers via `register_completion_provider()`
+
+Providers receive `prefix`, `arguments`, `ref`, and `argument`, and may
+return either a plain list or `{ "values": [...], "total": N,
+"hasMore": bool }`. Results are prefix-filtered, deduplicated, and
+capped at 100 values.
+
+For runtime logs, call `notify_log_message()` / `log_message()` with one
+of the standard MCP levels (`debug`, `info`, `notice`, `warning`,
+`error`, `critical`, `alert`, `emergency`). Payloads are redacted
+recursively by default for common secret-looking keys and bearer/token
+strings; pass `sanitize=False` to opt out explicitly.
+
+Progress and cancellation are request-local. If a client supplies
+`params._meta.progressToken`, server code can read it with
+`get_progress_token()` and emit `notifications/progress` via
+`notify_progress(...)` or the server instance method of the same name.
+No token means no progress notification is sent. Cancellation arrives as
+`notifications/cancelled`; async handlers are cancelled actively when
+possible, while sync handlers are cooperative only and should call
+`is_request_cancelled()` / `raise_if_cancelled()` inside long-running
+work.
+
 ---
 
 ## 📁 Resources
@@ -313,10 +361,21 @@ echo '{"jsonrpc": "2.0", "method": "prompts/get", "params": {"name": "code_revie
 `resource_template_<name>` become parameterised resource templates whose
 signature parameters fill in the URI placeholders.
 
-The MCP capability is declared automatically on `initialize` --
-`{"resources": {"subscribe": true, "listChanged": true}}` -- and the
-following methods are wired through:
+The MCP capability set is declared automatically on `initialize`:
 
+* `tools: {"listChanged": true}`
+* `prompts: {"get": true, "listChanged": true}`
+* `resources: {"subscribe": true, "listChanged": true}`
+* `logging: {}`
+* `completions: {}` when prompt/resource-template completion is available
+
+The following methods are wired through:
+
+* `tools/list`, `prompts/list`, `resources/list`, and
+  `resources/templates/list` return stable sorted results. When called
+  without pagination params they preserve the previous one-shot behaviour.
+  When called with `pageSize` (or a returned `cursor`) they return a page
+  plus `nextCursor`.
 * `resources/list` -- returns every `resource_*` method, plus anything
   registered via `register_resource()`.
 * `resources/templates/list` -- every `resource_template_*` method, plus
@@ -383,24 +442,41 @@ Base class for synchronous MCP servers.
 * `discover_prompts()` -- finds all `prompt_*` methods on the subclass.
 * `discover_resources()` / `discover_resource_templates()` -- finds all
   `resource_*` and `resource_template_*` methods on the subclass.
+* `register_tool(name, callable, ...)` / `unregister_tool(name)` --
+  runtime registration of tools. These are mutation-only; call
+  `notify_tool_list_changed()` explicitly afterwards, or use
+  `register_tool_and_notify(...)` / `unregister_tool_and_notify(...)`.
+  `register_tool()` also accepts `output_schema=...`, and tool methods
+  may expose `_mcp_output_schema` metadata for `tools/list`.
+* `register_prompt(name, callable, ...)` / `unregister_prompt(name)` --
+  runtime registration of prompts. These are mutation-only; call
+  `notify_prompt_list_changed()` explicitly afterwards, or use
+  `register_prompt_and_notify(...)` /
+  `unregister_prompt_and_notify(...)`.
 * `register_resource(uri, callable, ...)` /
   `register_resource_template(uri_template, callable, ...)` -- runtime
   registration of resources/templates.
-* `notify_resource_updated(uri)` /
-  `notify_resource_list_changed()` -- emit MCP notifications when
-  resource state changes.  In `AsyncMCPServer`, both are coroutines.
-* `handle_tools_call()` -- dispatches a tool call.
+* `notify_tool_list_changed()` / `notify_prompt_list_changed()` /
+  `notify_resource_updated(uri)` / `notify_resource_list_changed()` --
+  emit MCP notifications when the advertised catalogue changes. In
+  `AsyncMCPServer`, these notification helpers are coroutines.
+* `handle_tools_call()` -- dispatches a tool call. Mapping / structured
+  tool results preserve the legacy text `content` block and also expose
+  `structuredContent` when possible; advertised `outputSchema` values are
+  validated on the way out.
 * `handle_prompt_get()` -- dispatches a prompt fetch.
 * `get_config()` -- override to declare server name, version, capabilities.
 * `get_instructions()` -- override to give the model session-level guidance.
 * `run()` -- start the server on the configured transport (stdio by default; plain `--port N` retains legacy SSE, `--http` selects Streamable HTTP, and `--tcp` selects raw TCP).
 * `authenticate_request()` / `authorize_request()` -- optional HTTP identity and policy hooks. The default principal is anonymous for compatibility.
-* `get_request_context()` -- return immutable request-local transport, protocol, principal, peer, and header metadata.
+* Module-level `umcp.get_request_context()` -- return immutable request-local transport, protocol, principal, peer, and header metadata.
 
 #### `AsyncMCPServer` (`aioumcp.py`)
 
-Same surface, but `tool_*` and `prompt_*` methods may be `async def`.
-Use this when your tools are network-bound; use `MCPServer` when
+The same MCP feature surface, with coroutine entry points named
+`process_request_async()`, `run_socket_async()`, `run_sse_async()`, and
+`run_streamable_http_async()`; `tool_*` and `prompt_*` methods may also be
+`async def`. Use this when your tools are network-bound; use `MCPServer` when
 they're local-disk or compute-bound.
 
 ### Request identity and context
@@ -512,8 +588,7 @@ python -m pytest tests/test_resources.py -v
 | `test_streamable_http_regressions.py` | auth, Origin, CORS, limits, context isolation, CLI, and remote-safe errors |
 | `simple_async_test.py` | smoke tests for the async base |
 
-The current suite has **185 tests** covering both bases and runs on Python
-3.10, 3.11, and 3.12.
+The suite covers both bases and runs on Python 3.10, 3.11, and 3.12.
 
 ---
 
@@ -713,7 +788,7 @@ to simulate I/O. Remove these in real applications.
 ```python
 if __name__ == "__main__":
     server = MyServer()
-    server.log_level = "DEBUG"
+    server.logger.setLevel("DEBUG")
     server.run()
 ```
 

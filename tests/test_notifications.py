@@ -184,8 +184,8 @@ def test_async_sse_updated_targets_only_subscribed_session() -> None:
     w1 = _FakeAsyncWriter()
     w2 = _FakeAsyncWriter()
     s._sse_sessions = {
-        "s1": (w1, asyncio.Event(), asyncio.Lock()),
-        "s2": (w2, asyncio.Event(), asyncio.Lock()),
+        "s1": (w1, asyncio.Event(), asyncio.Lock(), "anonymous"),
+        "s2": (w2, asyncio.Event(), asyncio.Lock(), "anonymous"),
     }
     s._resource_session_subscriptions = {
         "s1": {"umcp://x/a"},
@@ -204,8 +204,8 @@ def test_async_sse_list_changed_broadcasts_to_all_sessions() -> None:
     w1 = _FakeAsyncWriter()
     w2 = _FakeAsyncWriter()
     s._sse_sessions = {
-        "s1": (w1, asyncio.Event(), asyncio.Lock()),
-        "s2": (w2, asyncio.Event(), asyncio.Lock()),
+        "s1": (w1, asyncio.Event(), asyncio.Lock(), "anonymous"),
+        "s2": (w2, asyncio.Event(), asyncio.Lock(), "anonymous"),
     }
 
     asyncio.run(s.notify_resource_list_changed())

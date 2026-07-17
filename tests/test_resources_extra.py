@@ -7,7 +7,7 @@
 * Custom URI schemes (file://, https://, custom://)
 * Annotations carried through (audience, priority, lastModified)
 * _mcp_resource override of name and uri
-* Pagination cursor in list params is accepted (and ignored cleanly)
+* Pagination cursor support for resources and templates lists
 * Async dynamic register_resource works
 * Async resource that raises returns -32603
 """
@@ -238,7 +238,7 @@ def test_override_attribute_replaces_default_uri_and_name() -> None:
     assert res["title"] == "Friendly title"
 
 
-# ---------- pagination cursor accepted but ignored --------------------------
+# ---------- pagination cursor support --------------------------------------
 
 
 class _Tiny(MCPServer):
@@ -247,24 +247,23 @@ class _Tiny(MCPServer):
         return "x"
 
 
-def test_resources_list_accepts_cursor_param() -> None:
+def test_resources_list_paginates_when_requested() -> None:
     s = _Tiny()
     resp = _send(s, {
         "jsonrpc": "2.0", "id": 1, "method": "resources/list",
-        "params": {"cursor": "ignored"},
+        "params": {"pageSize": 1},
     })
-    # Should succeed even though we don't paginate.
     assert "error" not in resp
-    assert any(r["name"] == "only" for r in resp["result"]["resources"])
+    assert [r["name"] for r in resp["result"]["resources"]] == ["only"]
 
 
-def test_resources_templates_list_accepts_cursor_param() -> None:
+def test_resources_templates_list_without_cursor_preserves_compatibility() -> None:
     s = _Tiny()
     resp = _send(s, {
         "jsonrpc": "2.0", "id": 1, "method": "resources/templates/list",
-        "params": {"cursor": "ignored"},
     })
     assert "error" not in resp
+    assert resp["result"]["resourceTemplates"] == []
 
 
 # ---------- async dynamic registration --------------------------------------
