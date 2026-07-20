@@ -82,6 +82,7 @@ from uuid import uuid4
 
 from umcp_shared import (
     MCPCancellationState,
+    MCPHTTPResponse,
     MCPPrincipal,
     MCPRequestCancelled,
     MCPRequestContext,
@@ -100,6 +101,7 @@ from umcp_shared import (
     is_valid_jsonrpc_response,
     media_accepts_event_stream,
     media_accepts_json,
+    http_status_line,
     origin_is_allowed,
     raise_if_cancelled as _raise_if_cancelled,
     request_target_path,
@@ -107,6 +109,7 @@ from umcp_shared import (
     reset_request_runtime,
     set_request_context,
     set_request_runtime,
+    validate_http_response,
 )
 
 
@@ -1756,6 +1759,9 @@ class AsyncMCPServer:
             return legacy(self, principal, rpc_method, params)
         return True
 
+    def handle_http_request(self, *, method: str, path: str, headers: Mapping[str, str], body: bytes, peer: str | None) -> MCPHTTPResponse | None:
+        return None
+
     # Back-compat aliases.
     def authenticate(self, headers: Mapping[str, str], peer: Any) -> MCPPrincipal | None:
         request_hook = type(self).authenticate_request
@@ -1785,6 +1791,10 @@ class AsyncMCPServer:
 
     async def authorize_request_async(self, principal: MCPPrincipal | None, *, rpc_method: str | None, tool_name: str | None) -> bool:
         result = self.authorize_request(principal, rpc_method=rpc_method, tool_name=tool_name)
+        return await result if isawaitable(result) else result
+
+    async def handle_http_request_async(self, *, method: str, path: str, headers: Mapping[str, str], body: bytes, peer: str | None) -> MCPHTTPResponse | None:
+        result = self.handle_http_request(method=method, path=path, headers=headers, body=body, peer=peer)
         return await result if isawaitable(result) else result
 
     async def authenticate_async(self, headers: Mapping[str, str], peer: Any) -> MCPPrincipal | None:
@@ -1895,6 +1905,9 @@ class AsyncMCPServer:
 
     def _validate_http_authorization_result(self, authorized: Any) -> bool:
         return isinstance(authorized, bool)
+
+    def _validate_http_route_response(self, response: Any, *, max_request_bytes: int) -> MCPHTTPResponse | None:
+        return validate_http_response(response, max_bytes=max_request_bytes)
 
     async def process_request_async(
         self, request_data: str, *, context: MCPRequestContext | None = None
@@ -2356,8 +2369,9 @@ class AsyncMCPServer:
     async def _handle_streamable_http_client(self, reader: StreamReader, writer: StreamWriter, endpoint: str, allowed_origins: list[str], max_request_bytes: int, host: str = "127.0.0.1") -> None:
         peer = writer.get_extra_info("peername")
 
-        async def send_response(status: str, *, body: bytes = b"", content_type: str | None = None, allow: str | None = None, www_authenticate: str | None = None, origin: str | None = None, extra_headers: tuple[tuple[str, str], ...] = ()) -> None:
-            response = [f"HTTP/1.1 {status}\r\n".encode()]
+        async def send_response(status: str | int, *, body: bytes = b"", content_type: str | None = None, allow: str | None = None, www_authenticate: str | None = None, origin: str | None = None, extra_headers: tuple[tuple[str, str], ...] = ()) -> None:
+            status_line = http_status_line(status) if isinstance(status, int) else status
+            response = [f"HTTP/1.1 {status_line}\r\n".encode()]
             if content_type:
                 response.append(f"Content-Type: {content_type}\r\n".encode())
             if allow:
@@ -2433,16 +2447,37 @@ class AsyncMCPServer:
             except (TimeoutError, IncompleteReadError):
                 await send_response("400 Bad Request", origin=allowed_origin)
                 return
-            if method == "OPTIONS":
-                if request_target_path(path) != endpoint:
+            request_path = request_target_path(path)
+            if request_path != endpoint:
+                try:
+                    hook_response = await self.handle_http_request_async(
+                        method=method,
+                        path=request_path,
+                        headers=headers,
+                        body=body,
+                        peer=peer[0] if peer else None,
+                    )
+                except Exception:
+                    self.logger.exception("HTTP auxiliary route hook failed for %s %s", method, request_path)
+                    await send_response("500 Internal Server Error", origin=allowed_origin)
+                    return
+                if hook_response is None:
                     await send_response("405 Method Not Allowed", allow="POST, OPTIONS", origin=allowed_origin)
                     return
+                validated = self._validate_http_route_response(hook_response, max_request_bytes=max_request_bytes)
+                if validated is None:
+                    self.logger.error("HTTP auxiliary route hook returned invalid response: %r", hook_response)
+                    await send_response("500 Internal Server Error", origin=allowed_origin)
+                    return
+                await send_response(validated.status, body=validated.body, content_type=validated.content_type, origin=allowed_origin, extra_headers=validated.headers)
+                return
+            if method == "OPTIONS":
                 if not origin:
                     await send_response("405 Method Not Allowed", allow="POST, OPTIONS", origin=allowed_origin)
                     return
                 await send_response("204 No Content", origin=allowed_origin, extra_headers=(("Access-Control-Allow-Methods", "POST, OPTIONS"), ("Access-Control-Allow-Headers", "Content-Type, Accept, MCP-Protocol-Version, Authorization")))
                 return
-            if method != "POST" or request_target_path(path) != endpoint:
+            if method != "POST":
                 await send_response("405 Method Not Allowed", allow="POST, OPTIONS", origin=allowed_origin)
                 return
             if not content_type_is_json(headers.get("content-type")):

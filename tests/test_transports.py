@@ -215,6 +215,51 @@ def test_sync_streamable_http_round_trip_and_error_paths() -> None:
         _kill(proc)
 
 
+def test_sync_streamable_http_auxiliary_routes_and_mcp_auth_boundary() -> None:
+    script = NamedTemporaryFile("w", suffix=".py", delete=False, dir=str(ROOT))
+    try:
+        script.write(
+            "from umcp import MCPServer\n"
+            "from umcp_shared import MCPHTTPResponse, MCPPrincipal\n"
+            "class S(MCPServer):\n"
+            "    def handle_http_request(self, *, method, path, headers, body, peer):\n"
+            "        if path == '/graph': return MCPHTTPResponse(200, b'graph', 'text/plain', (('Cache-Control', 'no-store'),))\n"
+            "        if path == '/graph/api' and method == 'POST': return MCPHTTPResponse(201, body, 'application/octet-stream')\n"
+            "        return None\n"
+            "    def authenticate_request(self, *, method, path, headers, peer):\n"
+            "        return MCPPrincipal(name='alice') if headers.get('authorization') == 'Bearer ok' else None\n"
+            "S().run()\n"
+        )
+        script.flush(); script.close()
+        proc = subprocess.Popen(
+            [sys.executable, script.name, "--port", "0", "--http"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+            cwd=str(ROOT),
+        )
+        try:
+            port = _wait_for_port(proc.stdout)
+            graph = _http_request("127.0.0.1", port, b"GET /graph HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n")
+            assert b"200 OK" in graph and graph.endswith(b"graph") and b"Cache-Control: no-store" in graph
+            payload = b"payload"
+            api = _http_request(
+                "127.0.0.1", port,
+                b"POST /graph/api HTTP/1.1\r\nHost: 127.0.0.1\r\n" + f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload,
+            )
+            assert b"201 Created" in api and api.endswith(payload)
+            missing = _http_request("127.0.0.1", port, b"GET /missing HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n")
+            assert b"405 Method Not Allowed" in missing
+            body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).encode()
+            mcp = _http_request(
+                "127.0.0.1", port,
+                b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json\r\n" + f"Content-Length: {len(body)}\r\n\r\n".encode() + body,
+            )
+            assert b"401 Unauthorized" in mcp
+        finally:
+            _kill(proc)
+    finally:
+        os.unlink(script.name)
+
+
 def test_sync_streamable_http_auth_401_and_403() -> None:
     script = NamedTemporaryFile("w", suffix=".py", delete=False, dir=str(ROOT))
     try:

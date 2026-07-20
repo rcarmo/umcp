@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from http import HTTPStatus
 from threading import Lock
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
@@ -43,6 +44,17 @@ class MCPRequestContext:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "headers", MappingProxyType(dict(self.headers)))
+
+
+@dataclass(frozen=True, slots=True)
+class MCPHTTPResponse:
+    status: int
+    body: bytes = b""
+    content_type: str | None = None
+    headers: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "headers", tuple(self.headers))
 
 
 @dataclass(slots=True)
@@ -255,3 +267,37 @@ def origin_is_allowed(
     if allowed_origins or not local_bind:
         return False
     return parsed.hostname.lower() in {"127.0.0.1", "localhost", "::1"}
+
+
+def http_status_line(status: int) -> str:
+    try:
+        phrase = HTTPStatus(status).phrase
+    except ValueError:
+        phrase = ""
+    return f"{status} {phrase}".rstrip()
+
+
+def validate_http_response(response: Any, *, max_bytes: int) -> MCPHTTPResponse | None:
+    if not isinstance(response, MCPHTTPResponse):
+        return None
+    if isinstance(response.status, bool) or not isinstance(response.status, int) or not 100 <= response.status <= 599:
+        return None
+    if not isinstance(response.body, bytes):
+        return None
+    total_bytes = len(response.body)
+    if response.content_type is not None:
+        if not isinstance(response.content_type, str) or "\r" in response.content_type or "\n" in response.content_type:
+            return None
+        total_bytes += len("Content-Type") + len(response.content_type)
+    for header in response.headers:
+        if not isinstance(header, tuple) or len(header) != 2:
+            return None
+        name, value = header
+        if not isinstance(name, str) or not isinstance(value, str):
+            return None
+        if "\r" in name or "\n" in name or "\r" in value or "\n" in value:
+            return None
+        total_bytes += len(name) + len(value)
+    if total_bytes > max_bytes:
+        return None
+    return response

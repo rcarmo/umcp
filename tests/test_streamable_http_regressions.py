@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import io
+import socket
+import threading
 import time
 
 import pytest
@@ -14,7 +17,7 @@ from json import dumps, loads
 from aioumcp import AsyncMCPServer
 from umcp import MCPServer
 from umcp_shared import (
-    MCPPrincipal, MCPRequestContext, get_request_context,
+    MCPHTTPResponse, MCPPrincipal, MCPRequestContext, get_request_context,
     media_accepts_json, origin_is_allowed,
 )
 
@@ -100,6 +103,34 @@ class AuthSync(MCPServer):
 
     def tool_forbidden(self):
         return "nope"
+
+
+class AuxiliarySync(MCPServer):
+    def handle_http_request(self, *, method, path, headers, body, peer):
+        if path == "/graph":
+            return MCPHTTPResponse(200, body=b"graph", content_type="text/plain", headers=(("Cache-Control", "no-store"),))
+        if path == "/graph/api" and method == "POST":
+            return MCPHTTPResponse(200, body=body, content_type="application/octet-stream")
+        return None
+
+
+class AuxiliaryAsync(AsyncMCPServer):
+    async def handle_http_request_async(self, *, method, path, headers, body, peer):
+        if path == "/graph":
+            return MCPHTTPResponse(200, body=b"graph", content_type="text/plain")
+        if path == "/graph/api" and method == "POST":
+            return MCPHTTPResponse(201, body=body, content_type="application/octet-stream")
+        return None
+
+
+class AuxiliaryExplodesAsync(AsyncMCPServer):
+    async def handle_http_request_async(self, **kwargs):
+        raise RuntimeError("secret route failure")
+
+
+class AuxiliaryMalformedAsync(AsyncMCPServer):
+    async def handle_http_request_async(self, **kwargs):
+        return MCPHTTPResponse(200, headers=(("X-Bad", "value\r\nInjected: yes"),))
 
 
 class ConcurrentSync(MCPServer):
@@ -382,6 +413,40 @@ def test_async_cors_headers_are_returned_on_preflight_and_post() -> None:
     request = f"POST /mcp HTTP/1.1\nOrigin: http://allowed\nContent-Type: application/json\nAccept: application/json\nAuthorization: Bearer ok\nContent-Length: {len(body)}"
     writer = asyncio.run(_run_async(server, request, body))
     assert b"Access-Control-Allow-Origin: http://allowed" in b"".join(writer.chunks)
+
+
+def test_async_auxiliary_http_routes_are_bounded_and_mcp_is_unchanged() -> None:
+    get_wire = b"".join(asyncio.run(_run_async(AuxiliaryAsync(), "GET /graph HTTP/1.1\nContent-Length: 0")).chunks)
+    assert b"200 OK" in get_wire and get_wire.endswith(b"graph")
+
+    body = b"payload"
+    post_wire = b"".join(asyncio.run(_run_async(
+        AuxiliaryAsync(),
+        f"POST /graph/api HTTP/1.1\nContent-Length: {len(body)}",
+        body,
+    )).chunks)
+    assert b"201 Created" in post_wire and post_wire.endswith(body)
+
+    missing = b"".join(asyncio.run(_run_async(AuxiliaryAsync(), "GET /missing HTTP/1.1\nContent-Length: 0")).chunks)
+    assert b"405 Method Not Allowed" in missing
+    exploded = b"".join(asyncio.run(_run_async(AuxiliaryExplodesAsync(), "GET /graph HTTP/1.1\nContent-Length: 0")).chunks)
+    assert b"500 Internal Server Error" in exploded and b"secret route failure" not in exploded
+    malformed = b"".join(asyncio.run(_run_async(AuxiliaryMalformedAsync(), "GET /graph HTTP/1.1\nContent-Length: 0")).chunks)
+    assert b"500 Internal Server Error" in malformed and b"Injected" not in malformed
+
+    duplicate = b"".join(asyncio.run(_run_async(
+        AuxiliaryAsync(),
+        "POST /graph/api HTTP/1.1\nContent-Length: 0\nContent-Length: 0",
+    )).chunks)
+    assert b"400 Bad Request" in duplicate
+
+    mcp_body = dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).encode()
+    mcp = b"".join(asyncio.run(_run_async(
+        AuthAsync(),
+        f"POST /mcp HTTP/1.1\nContent-Type: application/json\nAccept: application/json\nContent-Length: {len(mcp_body)}",
+        mcp_body,
+    )).chunks)
+    assert b"401 Unauthorized" in mcp
 
 
 def test_async_http_rejects_bad_content_length_and_oversize() -> None:

@@ -64,6 +64,7 @@ from logging import INFO, FileHandler, basicConfig, getLogger
 from pathlib import Path
 from umcp_shared import (
     MCPCancellationState,
+    MCPHTTPResponse,
     MCPPrincipal,
     MCPRequestCancelled,
     MCPRequestContext,
@@ -89,6 +90,7 @@ from umcp_shared import (
     reset_request_runtime,
     set_request_context,
     set_request_runtime,
+    validate_http_response,
 )
 from queue import Empty, Queue
 from sys import argv, exit
@@ -1727,6 +1729,9 @@ class MCPServer:
             return legacy(self, principal, rpc_method, params)
         return True
 
+    def handle_http_request(self, *, method: str, path: str, headers: Mapping[str, str], body: bytes, peer: str | None) -> MCPHTTPResponse | None:
+        return None
+
     # Back-compat aliases.
     def authenticate(self, headers: Mapping[str, str], peer: Any) -> MCPPrincipal | None:
         request_hook = type(self).authenticate_request
@@ -1829,6 +1834,9 @@ class MCPServer:
 
     def _validate_http_authorization_result(self, authorized: Any) -> bool:
         return isinstance(authorized, bool)
+
+    def _validate_http_route_response(self, response: Any, *, max_request_bytes: int) -> MCPHTTPResponse | None:
+        return validate_http_response(response, max_bytes=max_request_bytes)
 
     def process_request(
         self, input_data: str, *, context: MCPRequestContext | None = None
@@ -2088,6 +2096,62 @@ class MCPServer:
                     return True
                 return False
 
+            def _read_bounded_body(self, *, origin: str | None) -> bytes | object:
+                if self.headers.get("Transfer-Encoding"):
+                    self._empty(400, origin=origin)
+                    return self._HOOK_FAILURE
+                cl = self.headers.get("Content-Length")
+                try:
+                    n = int(cl) if cl is not None else 0
+                except ValueError:
+                    self._empty(400, origin=origin)
+                    return self._HOOK_FAILURE
+                if n < 0:
+                    self._empty(400, origin=origin)
+                    return self._HOOK_FAILURE
+                if n > max_request_bytes:
+                    self._empty(413, origin=origin)
+                    return self._HOOK_FAILURE
+                try:
+                    body = self.rfile.read(n)
+                except TimeoutError:
+                    self._empty(400, origin=origin)
+                    return self._HOOK_FAILURE
+                if len(body) != n:
+                    self._empty(400, origin=origin)
+                    return self._HOOK_FAILURE
+                return body
+
+            def _call_http_route(self, *, method: str, path: str, body: bytes, origin: str | None) -> MCPHTTPResponse | None | object:
+                try:
+                    response = server_self.handle_http_request(
+                        method=method,
+                        path=path,
+                        headers=self._headers_lower(),
+                        body=body,
+                        peer=self.client_address[0] if self.client_address else None,
+                    )
+                except Exception:
+                    server_self.logger.exception("HTTP auxiliary route hook failed for %s %s", method, path)
+                    self._empty(500, origin=origin)
+                    return self._HOOK_FAILURE
+                if isawaitable(response):
+                    close = getattr(response, "close", None)
+                    if close:
+                        close()
+                    server_self.logger.error("Async auxiliary HTTP hook used with MCPServer")
+                    self._empty(500, origin=origin)
+                    return self._HOOK_FAILURE
+                if response is None:
+                    return None
+                validated = server_self._validate_http_route_response(response, max_request_bytes=max_request_bytes)
+                if validated is None:
+                    server_self.logger.error("HTTP auxiliary route hook returned invalid response: %r", response)
+                    self._empty(500, origin=origin)
+                    return self._HOOK_FAILURE
+                self._send_response(validated.status, body=validated.body, content_type=validated.content_type, origin=origin, extra_headers=validated.headers)
+                return validated
+
             def _call_authenticate(self, *, method: str, path: str, origin: str | None) -> MCPPrincipal | None | object:
                 try:
                     principal = server_self.authenticate_request(method=method, path=path, headers=self._headers_lower(), peer=self.client_address[0] if self.client_address else None)
@@ -2136,8 +2200,16 @@ class MCPServer:
                     return
                 if self._reject_disallowed_origin(origin):
                     return
-                if self._request_path() != endpoint:
-                    self._send_method_not_allowed(origin=origin)
+                request_path = self._request_path()
+                if request_path != endpoint:
+                    body = self._read_bounded_body(origin=origin)
+                    if body is self._HOOK_FAILURE:
+                        return
+                    response = self._call_http_route(method="OPTIONS", path=request_path, body=body, origin=origin)
+                    if response is self._HOOK_FAILURE:
+                        return
+                    if response is None:
+                        self._send_method_not_allowed(origin=origin)
                     return
                 if not origin_header:
                     self._send_method_not_allowed(origin=origin)
@@ -2149,16 +2221,40 @@ class MCPServer:
                 if self._bad_headers(origin=origin):
                     self._empty(400, origin=origin)
                     return
-                if not self._reject_disallowed_origin(origin):
-                    self._send_method_not_allowed(origin=origin)
+                if self._reject_disallowed_origin(origin):
+                    return
+                request_path = self._request_path()
+                if request_path != endpoint:
+                    body = self._read_bounded_body(origin=origin)
+                    if body is self._HOOK_FAILURE:
+                        return
+                    response = self._call_http_route(method="GET", path=request_path, body=body, origin=origin)
+                    if response is self._HOOK_FAILURE:
+                        return
+                    if response is None:
+                        self._send_method_not_allowed(origin=origin)
+                    return
+                self._send_method_not_allowed(origin=origin)
 
             def do_DELETE(self) -> None:
                 origin = self._allowed_origin()
                 if self._bad_headers(origin=origin):
                     self._empty(400, origin=origin)
                     return
-                if not self._reject_disallowed_origin(origin):
-                    self._send_method_not_allowed(origin=origin)
+                if self._reject_disallowed_origin(origin):
+                    return
+                request_path = self._request_path()
+                if request_path != endpoint:
+                    body = self._read_bounded_body(origin=origin)
+                    if body is self._HOOK_FAILURE:
+                        return
+                    response = self._call_http_route(method="DELETE", path=request_path, body=body, origin=origin)
+                    if response is self._HOOK_FAILURE:
+                        return
+                    if response is None:
+                        self._send_method_not_allowed(origin=origin)
+                    return
+                self._send_method_not_allowed(origin=origin)
 
             def do_POST(self) -> None:  # noqa: N802
                 self.connection.settimeout(30.0)
@@ -2168,30 +2264,21 @@ class MCPServer:
                     return
                 if self._reject_disallowed_origin(origin):
                     return
-                if self._request_path() != endpoint:
-                    self._send_method_not_allowed(origin=origin)
+                request_path = self._request_path()
+                body = self._read_bounded_body(origin=origin)
+                if body is self._HOOK_FAILURE:
                     return
-                if self.headers.get("Transfer-Encoding"):
-                    self._empty(400, origin=origin); return
+                if request_path != endpoint:
+                    response = self._call_http_route(method="POST", path=request_path, body=body, origin=origin)
+                    if response is self._HOOK_FAILURE:
+                        return
+                    if response is None:
+                        self._send_method_not_allowed(origin=origin)
+                    return
                 if not content_type_is_json(self.headers.get("Content-Type")):
                     self._empty(415, origin=origin); return
                 if not media_accepts_json(self.headers.get("Accept")):
                     self._empty(406, origin=origin); return
-                cl = self.headers.get("Content-Length")
-                try:
-                    n = int(cl) if cl is not None else 0
-                except ValueError:
-                    self._empty(400, origin=origin); return
-                if n < 0:
-                    self._empty(400, origin=origin); return
-                if n > max_request_bytes:
-                    self._empty(413, origin=origin); return
-                try:
-                    body = self.rfile.read(n)
-                except TimeoutError:
-                    self._empty(400, origin=origin); return
-                if len(body) != n:
-                    self._empty(400, origin=origin); return
                 principal = self._call_authenticate(method="POST", path=self.path, origin=origin)
                 if principal is self._HOOK_FAILURE:
                     return
