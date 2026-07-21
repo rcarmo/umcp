@@ -247,8 +247,9 @@ def origin_is_allowed(
     allowed_origins: list[str] | tuple[str, ...] = (),
     *,
     local_bind: bool = True,
+    request_authority: str | None = None,
 ) -> bool:
-    """Validate an Origin exactly; loopback origins are implicit only locally."""
+    """Validate an Origin exactly, including the current HTTP authority when known."""
     if not origin:
         return False
     parsed = urlparse(origin)
@@ -263,6 +264,8 @@ def origin_is_allowed(
     except ValueError:
         return False
     if origin in allowed_origins:
+        return True
+    if request_authority and origin == f"http://{request_authority}":
         return True
     if allowed_origins or not local_bind:
         return False

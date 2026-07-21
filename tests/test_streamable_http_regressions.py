@@ -378,6 +378,21 @@ def test_origin_validation_is_exact_and_remote_safe() -> None:
     assert not origin_is_allowed("http://localhost:3000", local_bind=False)
     assert not origin_is_allowed("http://localhost:3000", ["https://ui.example"])
     assert origin_is_allowed("https://ui.example", ["https://ui.example"], local_bind=False)
+    assert origin_is_allowed(
+        "http://memento.local:18081",
+        local_bind=False,
+        request_authority="memento.local:18081",
+    )
+    assert not origin_is_allowed(
+        "http://memento.local.evil:18081",
+        local_bind=False,
+        request_authority="memento.local:18081",
+    )
+    assert not origin_is_allowed(
+        "https://memento.local:18081",
+        local_bind=False,
+        request_authority="memento.local:18081",
+    )
 
 
 def test_accept_negotiation_matches_actual_response_type() -> None:

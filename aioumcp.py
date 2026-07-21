@@ -2182,7 +2182,7 @@ class AsyncMCPServer:
                 return
 
             origin = headers.get("origin")
-            allowed_origin = origin if origin and origin_is_allowed(origin, allowed_origins, local_bind=host in ("127.0.0.1", "localhost", "::1")) else None
+            allowed_origin = origin if origin and origin_is_allowed(origin, allowed_origins, local_bind=host in ("127.0.0.1", "localhost", "::1"), request_authority=headers.get("host")) else None
             if origin and not allowed_origin:
                 await send_response("403 Forbidden")
                 return
@@ -2418,7 +2418,7 @@ class AsyncMCPServer:
                 await send_response("400 Bad Request")
                 return
             origin = headers.get("origin")
-            allowed_origin = origin if origin and origin_is_allowed(origin, allowed_origins, local_bind=host in ("127.0.0.1", "localhost", "::1")) else None
+            allowed_origin = origin if origin and origin_is_allowed(origin, allowed_origins, local_bind=host in ("127.0.0.1", "localhost", "::1"), request_authority=headers.get("host")) else None
             if origin and not allowed_origin:
                 await send_response("403 Forbidden")
                 return

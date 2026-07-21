@@ -2050,7 +2050,12 @@ class MCPServer:
                 origin = self.headers.get("Origin")
                 if not origin:
                     return None
-                if origin_is_allowed(origin, allowed_origins, local_bind=host in ("127.0.0.1", "localhost", "::1")):
+                if origin_is_allowed(
+                    origin,
+                    allowed_origins,
+                    local_bind=host in ("127.0.0.1", "localhost", "::1"),
+                    request_authority=self.headers.get("Host"),
+                ):
                     return origin
                 return None
 
@@ -2364,7 +2369,12 @@ class MCPServer:
                 origin = self.headers.get("Origin")
                 if not origin:
                     return None
-                if origin_is_allowed(origin, allowed_origins, local_bind=host in ("127.0.0.1", "localhost", "::1")):
+                if origin_is_allowed(
+                    origin,
+                    allowed_origins,
+                    local_bind=host in ("127.0.0.1", "localhost", "::1"),
+                    request_authority=self.headers.get("Host"),
+                ):
                     return origin
                 return None
 
