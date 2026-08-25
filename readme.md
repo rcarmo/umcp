@@ -130,7 +130,7 @@ MCP clients should still perform the normal initialize handshake.
 Streamable HTTP accepts one JSON-RPC object per `POST`. Requests return
 `200 application/json`; notifications and client responses return `202`.
 The initial `initialize` negotiates either `2025-03-26` or `2024-11-05`.
-Later requests must send a supported value in `MCP-Protocol-Version`.
+Later requests must send a supported value in `MCP-Protocol-Version`. A missing or unsupported value returns `400 application/json` with the preferred and supported protocol versions rather than an empty response.
 Request targets are matched on the URL path, so `/mcp?trace=1` is accepted
 and treated the same as `/mcp`. HTTP/1.1 requires exactly one `Host` header;
 HTTP/1.0 may omit it. Duplicate `Host`, `Authorization`, `Origin`, `Accept`,

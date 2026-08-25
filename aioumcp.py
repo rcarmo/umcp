@@ -103,6 +103,7 @@ from umcp_shared import (
     media_accepts_json,
     http_status_line,
     origin_is_allowed,
+    protocol_version_error,
     raise_if_cancelled as _raise_if_cancelled,
     request_target_path,
     reset_request_context,
@@ -2512,7 +2513,12 @@ class AsyncMCPServer:
             rpc_method = req.get("method")
             version = headers.get("mcp-protocol-version")
             if rpc_method != "initialize" and version not in SUPPORTED_PROTOCOL_VERSIONS:
-                await send_response("400 Bad Request", origin=allowed_origin)
+                await send_response(
+                    "400 Bad Request",
+                    body=dumps(protocol_version_error(version)).encode("utf-8"),
+                    content_type="application/json",
+                    origin=allowed_origin,
+                )
                 return
             is_response = (
                 rpc_method is None

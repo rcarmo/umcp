@@ -140,6 +140,22 @@ def exact_or_fallback(accepted: str | None, preferred: str) -> str:
     return preferred
 
 
+def protocol_version_error(version: str | None) -> dict[str, object]:
+    """Build an actionable HTTP error for a missing or unsupported MCP version."""
+    payload: dict[str, object] = {
+        "error": (
+            "missing MCP-Protocol-Version header"
+            if version is None
+            else "unsupported MCP-Protocol-Version header"
+        ),
+        "expected": SUPPORTED_PROTOCOL_VERSIONS[0],
+        "supported": list(SUPPORTED_PROTOCOL_VERSIONS),
+    }
+    if version is not None:
+        payload["received"] = version
+    return payload
+
+
 def is_jsonrpc_object(value: Any) -> bool:
     return isinstance(value, dict)
 

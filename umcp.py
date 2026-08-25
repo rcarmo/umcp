@@ -84,6 +84,7 @@ from umcp_shared import (
     media_accepts_event_stream,
     media_accepts_json,
     origin_is_allowed,
+    protocol_version_error,
     raise_if_cancelled as _raise_if_cancelled,
     request_target_path,
     reset_request_context,
@@ -2299,7 +2300,8 @@ class MCPServer:
                 rpc_method = req.get("method")
                 version = self.headers.get("MCP-Protocol-Version")
                 if rpc_method != "initialize" and version not in SUPPORTED_PROTOCOL_VERSIONS:
-                    self._empty(400, origin=origin); return
+                    self._json(protocol_version_error(version), status=400, origin=origin)
+                    return
                 is_response = (
                     rpc_method is None
                     and "id" in req

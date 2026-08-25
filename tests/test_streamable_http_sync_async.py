@@ -110,3 +110,35 @@ def test_async_streamable_http_accepts_json_and_context():
     writer = asyncio.run(_invoke_async_handler(server, request, body))
     writer.chunks
     assert any(b"200 OK" in chunk or b"202 Accepted" in chunk for chunk in writer.chunks)
+
+
+def test_async_streamable_http_explains_missing_and_unsupported_protocol_versions():
+    server = AsyncHTTPServer()
+    body = dumps({"jsonrpc": "2.0", "method": "tools/list", "id": 1}).encode()
+    for version, expected_error in (
+        (None, "missing MCP-Protocol-Version header"),
+        ("not-a-version", "unsupported MCP-Protocol-Version header"),
+    ):
+        headers = [
+            "POST /mcp HTTP/1.1",
+            "Host: test",
+            "Content-Type: application/json",
+            "Accept: application/json",
+            "Origin: http://allowed",
+        ]
+        if version is not None:
+            headers.append(f"MCP-Protocol-Version: {version}")
+        headers.append(f"Content-Length: {len(body)}")
+
+        writer = asyncio.run(_invoke_async_handler(server, "\n".join(headers), body))
+        wire = b"".join(writer.chunks)
+        response_headers, response_body = wire.split(b"\r\n\r\n", 1)
+        payload = loads(response_body)
+
+        assert b"400 Bad Request" in response_headers
+        assert b"Content-Type: application/json" in response_headers
+        assert payload["error"] == expected_error
+        assert payload["expected"] == "2025-03-26"
+        assert payload["supported"] == ["2025-03-26", "2024-11-05"]
+        if version is not None:
+            assert payload["received"] == version

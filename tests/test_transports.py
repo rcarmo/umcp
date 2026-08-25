@@ -176,6 +176,36 @@ def test_sync_streamable_http_round_trip_and_error_paths() -> None:
         )
         assert b"200 OK" in response and b'"tools"' in response
 
+        for version, expected_error in (
+            (None, "missing MCP-Protocol-Version header"),
+            ("not-a-version", "unsupported MCP-Protocol-Version header"),
+        ):
+            version_header = (
+                b"" if version is None else f"MCP-Protocol-Version: {version}\r\n".encode("ascii")
+            )
+            protocol_error = _http_request(
+                "127.0.0.1",
+                port,
+                (
+                    b"POST /mcp HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Accept: application/json\r\n"
+                    + version_header
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                    + body
+                ),
+            )
+            response_headers, response_body = protocol_error.split(b"\r\n\r\n", 1)
+            payload = json.loads(response_body)
+            assert b"400 Bad Request" in response_headers
+            assert b"Content-Type: application/json" in response_headers
+            assert payload["error"] == expected_error
+            assert payload["expected"] == "2025-03-26"
+            assert payload["supported"] == ["2025-03-26", "2024-11-05"]
+            if version is not None:
+                assert payload["received"] == version
+
         disallowed_get = _http_request(
             "127.0.0.1", port,
             b"GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\n\r\n",
