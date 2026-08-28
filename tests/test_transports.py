@@ -148,7 +148,7 @@ def _http_request(host: str, port: int, request: bytes, *, shutdown_write: bool 
         while True:
             try:
                 chunk = sock.recv(4096)
-            except socket.timeout:
+            except TimeoutError:
                 break
             if not chunk:
                 break
@@ -223,7 +223,7 @@ def test_sync_streamable_http_round_trip_and_error_paths() -> None:
             b"OPTIONS /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
         )
         assert b"405 Method Not Allowed" in no_origin
-        assert b"Allow: POST, OPTIONS" in no_origin
+        assert b"Allow: GET, POST, DELETE, OPTIONS" in no_origin
 
         oversized_header = _http_request(
             "127.0.0.1",
@@ -260,7 +260,8 @@ def test_sync_streamable_http_auxiliary_routes_and_mcp_auth_boundary() -> None:
             "        return MCPPrincipal(name='alice') if headers.get('authorization') == 'Bearer ok' else None\n"
             "S().run()\n"
         )
-        script.flush(); script.close()
+        script.flush()
+        script.close()
         proc = subprocess.Popen(
             [sys.executable, script.name, "--port", "0", "--http"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
@@ -305,7 +306,8 @@ def test_sync_streamable_http_auth_401_and_403() -> None:
             "        return 'x'\n"
             "S().run()\n"
         )
-        script.flush(); script.close()
+        script.flush()
+        script.close()
         proc = subprocess.Popen(
             [sys.executable, script.name, "--port", "0", "--http"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
@@ -353,7 +355,8 @@ def test_sync_streamable_http_legacy_auth_alias_cors_errors_and_length_guards() 
             "        return 'x'\n"
             "S().run()\n"
         )
-        script.flush(); script.close()
+        script.flush()
+        script.close()
         proc = subprocess.Popen(
             [sys.executable, script.name, "--port", "0", "--http", "--allowed-origin", "http://allowed"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
@@ -365,7 +368,7 @@ def test_sync_streamable_http_legacy_auth_alias_cors_errors_and_length_guards() 
             requests = [
                 (
                     b"GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://allowed\r\nContent-Length: 0\r\n\r\n",
-                    b"405 Method Not Allowed",
+                    b"400 Bad Request",
                 ),
                 (
                     b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://allowed\r\nContent-Type: text/plain\r\nAccept: application/json\r\nAuthorization: Bearer ok\r\nContent-Length: 0\r\n\r\n",
@@ -440,7 +443,8 @@ def test_sync_streamable_http_rejects_async_auth_hooks_cleanly() -> None:
             "        return None\n"
             "S().run()\n"
         )
-        script.flush(); script.close()
+        script.flush()
+        script.close()
         proc = subprocess.Popen(
             [sys.executable, script.name, "--port", "0", "--http"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -478,7 +482,8 @@ def test_sync_sse_security_origin_and_body_guards() -> None:
             "        return True\n"
             "S().run()\n"
         )
-        script.flush(); script.close()
+        script.flush()
+        script.close()
         proc = subprocess.Popen([sys.executable, script.name, "--port", "0", "--sse", "--allowed-origin", "http://allowed"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, cwd=str(ROOT))
         try:
             port = _wait_for_port(proc.stdout)
@@ -539,7 +544,8 @@ def test_sync_sse_session_cleanup_race_returns_404() -> None:
             "        return True\n"
             "S().run()\n"
         )
-        script.flush(); script.close()
+        script.flush()
+        script.close()
         proc = subprocess.Popen(
             [sys.executable, script.name, "--port", "0", "--sse"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "umcp"
-version = "0.2.1"
+version = "0.2.2"
 description = "Lightweight zero-dependency Model Context Protocol (MCP) server in pure Python."
 readme = "readme.md"
 license = { file = "LICENSE" }

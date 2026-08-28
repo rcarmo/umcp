@@ -41,13 +41,15 @@ if _os.name == "nt":
 _stdin_bin  = _sys.stdin.buffer
 _stdout_bin = _sys.stdout.buffer
 
-from base64 import b64encode, urlsafe_b64decode, urlsafe_b64encode
-from dataclasses import MISSING, asdict, fields, is_dataclass
-from enum import Enum
+import math
 import re
 import socketserver
 import threading
 import traceback
+from base64 import b64encode, urlsafe_b64decode, urlsafe_b64encode
+from collections.abc import Mapping
+from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
+from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from inspect import (
     Parameter,
@@ -58,34 +60,37 @@ from inspect import (
     ismethod,
     signature,
 )
-import math
-from json import JSONDecodeError, dumps, loads as _json_loads
+from json import JSONDecodeError, dumps
+from json import loads as _json_loads
 from logging import INFO, FileHandler, basicConfig, getLogger
 from pathlib import Path
+from queue import Empty, Full, Queue
+from sys import argv, exit
+from time import monotonic
+from types import UnionType
+from typing import Any, Literal, Union, get_args, get_origin, get_type_hints, is_typeddict
+
 from umcp_shared import (
+    SUPPORTED_PROTOCOL_VERSIONS,
     MCPCancellationState,
     MCPHTTPResponse,
     MCPPrincipal,
     MCPRequestCancelled,
     MCPRequestContext,
     MCPRequestRuntime,
-    SUPPORTED_PROTOCOL_VERSIONS,
     content_type_is_json,
     exact_or_fallback,
-    get_progress_token as _get_progress_token,
     get_request_context,
     get_request_runtime,
-    is_jsonrpc_object,
-    is_request_cancelled as _is_request_cancelled,
-    is_valid_jsonrpc_id,
-    is_valid_jsonrpc_response,
     has_ambiguous_singleton_values,
     has_singleton_header_violations,
+    is_jsonrpc_object,
+    is_valid_jsonrpc_id,
+    is_valid_jsonrpc_response,
     media_accepts_event_stream,
     media_accepts_json,
     origin_is_allowed,
     protocol_version_error,
-    raise_if_cancelled as _raise_if_cancelled,
     request_target_path,
     reset_request_context,
     reset_request_runtime,
@@ -93,11 +98,15 @@ from umcp_shared import (
     set_request_runtime,
     validate_http_response,
 )
-from queue import Empty, Queue
-from sys import argv, exit
-from types import UnionType
-from typing import Any, Literal, Mapping, Union, get_args, get_origin, get_type_hints, is_typeddict
-
+from umcp_shared import (
+    get_progress_token as _get_progress_token,
+)
+from umcp_shared import (
+    is_request_cancelled as _is_request_cancelled,
+)
+from umcp_shared import (
+    raise_if_cancelled as _raise_if_cancelled,
+)
 
 _STRUCTURED_UNSET = object()
 from urllib.parse import parse_qs
@@ -131,6 +140,17 @@ def notify_progress(progress: float | int, total: float | int | None = None, mes
     runtime.progress_callback(progress, total, message)
 
 
+@dataclass(slots=True)
+class _StreamableHTTPSession:
+    principal: str
+    protocol_version: str
+    created_at: float
+    last_seen: float
+    queue: Queue
+    disconnect_event: threading.Event
+    stream_open: bool = False
+
+
 class MCPServer:
     """Core MCP server implementation using JSON-RPC 2.0 protocol."""
 
@@ -145,6 +165,14 @@ class MCPServer:
         # SSE session registry: session_id -> (Queue[bytes], principal name).
         self._sse_sessions: dict[str, tuple[Queue, str]] = {}
         self._sse_lock = threading.Lock()
+        self._streamable_http_sessions: dict[str, _StreamableHTTPSession] = {}
+        self._streamable_http_lock = threading.RLock()
+        self.streamable_http_session_ttl_seconds = 30 * 60
+        self.streamable_http_keepalive_seconds = 15.0
+        self.streamable_http_request_timeout_seconds = 30.0
+        self.streamable_http_max_sessions = 1024
+        self.streamable_http_max_requests_per_connection = 1000
+        self._streamable_http_active = False
 
         # Resource subscriptions. For stdio / TCP / file mode we keep a
         # transport-global set of URIs. For SSE we also track per-session
@@ -200,7 +228,7 @@ class MCPServer:
             "protocolVersion": SUPPORTED_PROTOCOL_VERSIONS[0],
             "serverInfo": {
                 "name": self.__class__.__name__,
-                "version": "0.1.0"
+                "version": "0.2.2"
             },
             "capabilities": capabilities,
             "instructions": self.get_instructions()
@@ -1106,6 +1134,30 @@ class MCPServer:
             self._resource_subscriptions.discard(uri)
         return self.create_response(request_id, {}, None)
 
+    @staticmethod
+    def _disconnect_streamable_http_session(session: _StreamableHTTPSession) -> None:
+        session.disconnect_event.set()
+        try:
+            session.queue.put_nowait(b"")
+        except Full:
+            try:
+                session.queue.get_nowait()
+            except Empty:
+                pass
+            session.queue.put_nowait(b"")
+
+    def _expire_streamable_http_sessions_locked(self, now: float) -> None:
+        expired = [
+            session_id
+            for session_id, session in self._streamable_http_sessions.items()
+            if now - session.last_seen >= self.streamable_http_session_ttl_seconds
+        ]
+        for session_id in expired:
+            session = self._streamable_http_sessions.pop(session_id)
+            self._disconnect_streamable_http_session(session)
+            self._resource_session_subscriptions.pop(session_id, None)
+            self.logger.info("Streamable HTTP session %s expired", session_id)
+
     def _send_notification(
         self,
         method: str,
@@ -1123,17 +1175,35 @@ class MCPServer:
             notification["params"] = params
         payload_text = dumps(notification)
 
+        sse_blob = f"event: message\ndata: {payload_text}\n\n".encode()
+        delivered_to_http = False
         if self._sse_sessions:
-            sse_blob = f"event: message\ndata: {payload_text}\n\n".encode()
             with self._sse_lock:
                 target_items = list(self._sse_sessions.items())
                 if session_ids is not None:
                     target_items = [item for item in target_items if item[0] in session_ids]
-                for _sid, q in target_items:
-                    try:
-                        q.put(sse_blob)
-                    except Exception:  # noqa: BLE001
-                        pass
+                for _sid, session in target_items:
+                    queue = session[0] if isinstance(session, tuple) else session
+                    queue.put(sse_blob)
+                    delivered_to_http = True
+
+        if self._streamable_http_active:
+            now = monotonic()
+            with self._streamable_http_lock:
+                self._expire_streamable_http_sessions_locked(now)
+                target_items = list(self._streamable_http_sessions.items())
+                if session_ids is not None:
+                    target_items = [item for item in target_items if item[0] in session_ids]
+                queues = [session.queue for _sid, session in target_items if session.stream_open]
+            for queue in queues:
+                try:
+                    queue.put_nowait(sse_blob)
+                    delivered_to_http = True
+                except Full:
+                    self.logger.warning("Dropping Streamable HTTP notification because a session queue is full")
+            return
+
+        if delivered_to_http:
             return
 
         try:
@@ -2033,10 +2103,16 @@ class MCPServer:
 
         class _Handler(BaseHTTPRequestHandler):
             _HOOK_FAILURE = object()
+            protocol_version = "HTTP/1.1"
 
             def setup(self) -> None:
                 super().setup()
-                self.connection.settimeout(30.0)
+                self.connection.settimeout(server_self.streamable_http_request_timeout_seconds)
+                self._request_count = 0
+
+            def handle_one_request(self) -> None:
+                self._request_count += 1
+                super().handle_one_request()
 
             def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
                 server_self.logger.debug("HTTP %s - " + format, self.address_string(), *args)
@@ -2064,6 +2140,8 @@ class MCPServer:
                 return request_target_path(self.path)
 
             def _send_response(self, status: int, *, body: bytes = b"", content_type: str | None = None, allow: str | None = None, www_authenticate: str | None = None, origin: str | None = None, extra_headers: tuple[tuple[str, str], ...] = ()) -> None:
+                if self._request_count >= server_self.streamable_http_max_requests_per_connection:
+                    self.close_connection = True
                 self.send_response(status)
                 if content_type:
                     self.send_header("Content-Type", content_type)
@@ -2073,57 +2151,72 @@ class MCPServer:
                     self.send_header("WWW-Authenticate", www_authenticate)
                 if origin:
                     self.send_header("Access-Control-Allow-Origin", origin)
+                    self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
                     self.send_header("Vary", "Origin")
                 for key, value in extra_headers:
                     self.send_header(key, value)
+                if self.close_connection:
+                    self.send_header("Connection", "close")
+                elif self.request_version == "HTTP/1.0":
+                    self.send_header("Connection", "keep-alive")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 if body:
                     self.wfile.write(body)
 
-            def _json(self, payload: dict[str, Any], status: int = 200, *, origin: str | None = None) -> None:
-                self._send_response(status, body=dumps(payload).encode("utf-8"), content_type="application/json", origin=origin)
+            def _json(self, payload: dict[str, Any], status: int = 200, *, origin: str | None = None, extra_headers: tuple[tuple[str, str], ...] = ()) -> None:
+                self._send_response(status, body=dumps(payload).encode("utf-8"), content_type="application/json", origin=origin, extra_headers=extra_headers)
 
             def _empty(self, status: int, *, allow: str | None = None, www_authenticate: str | None = None, origin: str | None = None, extra_headers: tuple[tuple[str, str], ...] = ()) -> None:
                 self._send_response(status, allow=allow, www_authenticate=www_authenticate, origin=origin, extra_headers=extra_headers)
 
-            def _send_method_not_allowed(self, allow: str = "POST, OPTIONS", *, origin: str | None = None) -> None:
+            def _send_method_not_allowed(self, allow: str = "GET, POST, DELETE, OPTIONS", *, origin: str | None = None) -> None:
                 self._empty(405, allow=allow, origin=origin)
 
             def _bad_headers(self, *, origin: str | None) -> bool:
-                return (
+                bad = (
                     has_singleton_header_violations(self._header_counts(), http_version=self.request_version)
                     or has_ambiguous_singleton_values(self._headers_lower())
                 )
+                if bad:
+                    self.close_connection = True
+                return bad
 
             def _reject_disallowed_origin(self, origin: str | None) -> bool:
                 if self.headers.get("Origin") and not origin:
+                    self.close_connection = True
                     self._empty(403)
                     return True
                 return False
 
             def _read_bounded_body(self, *, origin: str | None) -> bytes | object:
                 if self.headers.get("Transfer-Encoding"):
+                    self.close_connection = True
                     self._empty(400, origin=origin)
                     return self._HOOK_FAILURE
                 cl = self.headers.get("Content-Length")
                 try:
                     n = int(cl) if cl is not None else 0
                 except ValueError:
+                    self.close_connection = True
                     self._empty(400, origin=origin)
                     return self._HOOK_FAILURE
                 if n < 0:
+                    self.close_connection = True
                     self._empty(400, origin=origin)
                     return self._HOOK_FAILURE
                 if n > max_request_bytes:
+                    self.close_connection = True
                     self._empty(413, origin=origin)
                     return self._HOOK_FAILURE
                 try:
                     body = self.rfile.read(n)
                 except TimeoutError:
+                    self.close_connection = True
                     self._empty(400, origin=origin)
                     return self._HOOK_FAILURE
                 if len(body) != n:
+                    self.close_connection = True
                     self._empty(400, origin=origin)
                     return self._HOOK_FAILURE
                 return body
@@ -2178,6 +2271,61 @@ class MCPServer:
                     return self._HOOK_FAILURE
                 return principal
 
+            def _validated_session(
+                self,
+                principal: MCPPrincipal,
+                *,
+                protocol_version: str,
+                required: bool,
+                origin: str | None,
+            ) -> tuple[str, _StreamableHTTPSession] | None | object:
+                session_id = self.headers.get("Mcp-Session-Id")
+                if not session_id:
+                    if required:
+                        self._empty(400, origin=origin)
+                        return self._HOOK_FAILURE
+                    return None
+                now = monotonic()
+                with server_self._streamable_http_lock:
+                    server_self._expire_streamable_http_sessions_locked(now)
+                    session = server_self._streamable_http_sessions.get(session_id)
+                    if session is None:
+                        self._empty(404, origin=origin)
+                        return self._HOOK_FAILURE
+                    if session.principal != principal.name:
+                        self._empty(403, origin=origin)
+                        return self._HOOK_FAILURE
+                    if session.protocol_version != protocol_version:
+                        self._json(protocol_version_error(protocol_version), status=400, origin=origin)
+                        return self._HOOK_FAILURE
+                    session.last_seen = now
+                return session_id, session
+
+            def _create_session(
+                self,
+                principal: MCPPrincipal,
+                protocol_version: str,
+                *,
+                origin: str | None,
+            ) -> str | object:
+                now = monotonic()
+                with server_self._streamable_http_lock:
+                    server_self._expire_streamable_http_sessions_locked(now)
+                    if len(server_self._streamable_http_sessions) >= server_self.streamable_http_max_sessions:
+                        self._empty(503, origin=origin)
+                        return self._HOOK_FAILURE
+                    session_id = str(uuid4())
+                    server_self._streamable_http_sessions[session_id] = _StreamableHTTPSession(
+                        principal=principal.name,
+                        protocol_version=protocol_version,
+                        created_at=now,
+                        last_seen=now,
+                        queue=Queue(maxsize=100),
+                        disconnect_event=threading.Event(),
+                    )
+                server_self.logger.info("Streamable HTTP session %s created for %s", session_id, principal.name)
+                return session_id
+
             def _call_authorize(self, principal: MCPPrincipal | None, *, rpc_method: str | None, tool_name: str | None, origin: str | None) -> bool | object:
                 try:
                     authorized = server_self.authorize_request(principal, rpc_method=rpc_method, tool_name=tool_name)
@@ -2220,7 +2368,14 @@ class MCPServer:
                 if not origin_header:
                     self._send_method_not_allowed(origin=origin)
                     return
-                self._empty(204, origin=origin, extra_headers=(("Access-Control-Allow-Methods", "POST, OPTIONS"), ("Access-Control-Allow-Headers", "Content-Type, Accept, MCP-Protocol-Version, Authorization")))
+                self._empty(
+                    204,
+                    origin=origin,
+                    extra_headers=(
+                        ("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"),
+                        ("Access-Control-Allow-Headers", "Content-Type, Accept, MCP-Protocol-Version, Mcp-Session-Id, Last-Event-ID, Authorization"),
+                    ),
+                )
 
             def do_GET(self) -> None:
                 origin = self._allowed_origin()
@@ -2240,7 +2395,73 @@ class MCPServer:
                     if response is None:
                         self._send_method_not_allowed(origin=origin)
                     return
-                self._send_method_not_allowed(origin=origin)
+                if not media_accepts_event_stream(self.headers.get("Accept")):
+                    self._empty(406, origin=origin)
+                    return
+                version = self.headers.get("MCP-Protocol-Version")
+                if version not in SUPPORTED_PROTOCOL_VERSIONS:
+                    self._json(protocol_version_error(version), status=400, origin=origin)
+                    return
+                principal = self._call_authenticate(method="GET", path=self.path, origin=origin)
+                if principal is self._HOOK_FAILURE:
+                    return
+                if principal is None:
+                    self._empty(401, www_authenticate="Bearer", origin=origin)
+                    return
+                validated = self._validated_session(principal, protocol_version=version, required=True, origin=origin)
+                if validated is self._HOOK_FAILURE or validated is None:
+                    return
+                session_id, session = validated
+                with server_self._streamable_http_lock:
+                    current = server_self._streamable_http_sessions.get(session_id)
+                    if current is not session:
+                        self._empty(404, origin=origin)
+                        return
+                    if session.stream_open:
+                        self._empty(409, origin=origin)
+                        return
+                    while True:
+                        try:
+                            session.queue.get_nowait()
+                        except Empty:
+                            break
+                    session.disconnect_event.clear()
+                    session.stream_open = True
+
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    if origin:
+                        self.send_header("Access-Control-Allow-Origin", origin)
+                        self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
+                        self.send_header("Vary", "Origin")
+                    self.end_headers()
+                    self.wfile.write(b": connected\n\n")
+                    self.wfile.flush()
+                    while not session.disconnect_event.is_set():
+                        try:
+                            payload = session.queue.get(timeout=server_self.streamable_http_keepalive_seconds)
+                        except Empty:
+                            payload = b": keepalive\n\n"
+                        if session.disconnect_event.is_set():
+                            break
+                        self.wfile.write(payload)
+                        self.wfile.flush()
+                        with server_self._streamable_http_lock:
+                            if server_self._streamable_http_sessions.get(session_id) is not session:
+                                break
+                            session.last_seen = monotonic()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                finally:
+                    self.close_connection = True
+                    with server_self._streamable_http_lock:
+                        if server_self._streamable_http_sessions.get(session_id) is session:
+                            session.stream_open = False
+                            session.last_seen = monotonic()
+                    server_self.logger.info("Streamable HTTP event stream %s disconnected", session_id)
 
             def do_DELETE(self) -> None:
                 origin = self._allowed_origin()
@@ -2250,20 +2471,42 @@ class MCPServer:
                 if self._reject_disallowed_origin(origin):
                     return
                 request_path = self._request_path()
+                body = self._read_bounded_body(origin=origin)
+                if body is self._HOOK_FAILURE:
+                    return
                 if request_path != endpoint:
-                    body = self._read_bounded_body(origin=origin)
-                    if body is self._HOOK_FAILURE:
-                        return
                     response = self._call_http_route(method="DELETE", path=request_path, body=body, origin=origin)
                     if response is self._HOOK_FAILURE:
                         return
                     if response is None:
                         self._send_method_not_allowed(origin=origin)
                     return
-                self._send_method_not_allowed(origin=origin)
+                version = self.headers.get("MCP-Protocol-Version")
+                if version not in SUPPORTED_PROTOCOL_VERSIONS:
+                    self._json(protocol_version_error(version), status=400, origin=origin)
+                    return
+                principal = self._call_authenticate(method="DELETE", path=self.path, origin=origin)
+                if principal is self._HOOK_FAILURE:
+                    return
+                if principal is None:
+                    self._empty(401, www_authenticate="Bearer", origin=origin)
+                    return
+                validated = self._validated_session(principal, protocol_version=version, required=True, origin=origin)
+                if validated is self._HOOK_FAILURE or validated is None:
+                    return
+                session_id, session = validated
+                with server_self._streamable_http_lock:
+                    if server_self._streamable_http_sessions.get(session_id) is not session:
+                        self._empty(404, origin=origin)
+                        return
+                    server_self._streamable_http_sessions.pop(session_id, None)
+                    server_self._disconnect_streamable_http_session(session)
+                    server_self._resource_session_subscriptions.pop(session_id, None)
+                server_self.logger.info("Streamable HTTP session %s deleted", session_id)
+                self._empty(200, origin=origin)
 
             def do_POST(self) -> None:  # noqa: N802
-                self.connection.settimeout(30.0)
+                self.connection.settimeout(server_self.streamable_http_request_timeout_seconds)
                 origin = self._allowed_origin()
                 if self._bad_headers(origin=origin):
                     self._empty(400, origin=origin)
@@ -2282,18 +2525,29 @@ class MCPServer:
                         self._send_method_not_allowed(origin=origin)
                     return
                 if not content_type_is_json(self.headers.get("Content-Type")):
-                    self._empty(415, origin=origin); return
+                    self._empty(415, origin=origin)
+                    return
                 if not media_accepts_json(self.headers.get("Accept")):
-                    self._empty(406, origin=origin); return
+                    self._empty(406, origin=origin)
+                    return
                 principal = self._call_authenticate(method="POST", path=self.path, origin=origin)
                 if principal is self._HOOK_FAILURE:
                     return
                 if principal is None:
-                    self._empty(401, www_authenticate="Bearer", origin=origin); return
+                    self._empty(401, www_authenticate="Bearer", origin=origin)
+                    return
                 try:
                     req = loads(body.decode("utf-8"))
                 except (UnicodeDecodeError, JSONDecodeError):
-                    self._json({"jsonrpc": "2.0", "error": server_self.create_error(-32700, "Parse error"), "id": None}, origin=origin); return
+                    self._json(
+                        {
+                            "jsonrpc": "2.0",
+                            "error": server_self.create_error(-32700, "Parse error"),
+                            "id": None,
+                        },
+                        origin=origin,
+                    )
+                    return
                 if not isinstance(req, dict):
                     self._json(server_self.create_response(None, None, server_self.create_error(-32600, "Invalid Request")), origin=origin)
                     return
@@ -2302,6 +2556,21 @@ class MCPServer:
                 if rpc_method != "initialize" and version not in SUPPORTED_PROTOCOL_VERSIONS:
                     self._json(protocol_version_error(version), status=400, origin=origin)
                     return
+                if rpc_method == "initialize" and self.headers.get("Mcp-Session-Id"):
+                    self._empty(400, origin=origin)
+                    return
+                session_id: str | None = None
+                if rpc_method != "initialize":
+                    validated = self._validated_session(
+                        principal,
+                        protocol_version=version,
+                        required=False,
+                        origin=origin,
+                    )
+                    if validated is self._HOOK_FAILURE:
+                        return
+                    if validated is not None:
+                        session_id, _session = validated
                 is_response = (
                     rpc_method is None
                     and "id" in req
@@ -2309,7 +2578,8 @@ class MCPServer:
                 )
                 is_notification = rpc_method is not None and "id" not in req
                 if is_response:
-                    self._empty(202, origin=origin); return
+                    self._empty(202, origin=origin)
+                    return
                 params = req.get("params") if isinstance(req.get("params"), dict) else {}
                 tool_name = params.get("name") if rpc_method == "tools/call" else None
                 authorized = self._call_authorize(principal, rpc_method=rpc_method, tool_name=tool_name, origin=origin)
@@ -2318,20 +2588,51 @@ class MCPServer:
                 if not authorized:
                     self._empty(403, origin=origin)
                     return
-                context = MCPRequestContext(transport="streamable-http", request_id=req.get("id"), protocol_version=version, session_id=None, principal=principal.name if principal else None, peer=self.client_address[0] if self.client_address else None, headers=self._headers_lower())
+                if session_id and rpc_method in ("resources/subscribe", "resources/unsubscribe"):
+                    req["params"] = dict(params)
+                    req["params"]["_session_id"] = session_id
+                context = MCPRequestContext(
+                    transport="streamable-http",
+                    request_id=req.get("id"),
+                    protocol_version=version,
+                    session_id=session_id,
+                    principal=principal.name,
+                    peer=self.client_address[0] if self.client_address else None,
+                    headers=self._headers_lower(),
+                )
                 response = server_self.process_request(dumps(req), context=context)
                 if is_notification:
                     response = None
                 if response is None:
-                    self._empty(202, origin=origin); return
-                self._json(response, origin=origin)
+                    self._empty(202, origin=origin)
+                    return
+                extra_headers: tuple[tuple[str, str], ...] = ()
+                if rpc_method == "initialize" and "result" in response:
+                    result = response.get("result")
+                    negotiated = result.get("protocolVersion") if isinstance(result, dict) else None
+                    if negotiated in SUPPORTED_PROTOCOL_VERSIONS:
+                        created = self._create_session(principal, negotiated, origin=origin)
+                        if created is self._HOOK_FAILURE:
+                            return
+                        extra_headers = (("Mcp-Session-Id", created),)
+                self._json(response, origin=origin, extra_headers=extra_headers)
 
         if host not in ("127.0.0.1", "localhost", "::1") and type(self).authenticate_request is MCPServer.authenticate_request and type(self).authenticate is MCPServer.authenticate:
             self.logger.warning("Streamable HTTP is bound beyond loopback without an authentication hook")
-        httpd = ThreadingHTTPServer((host, port), _Handler); httpd.daemon_threads = True
+        httpd = ThreadingHTTPServer((host, port), _Handler)
+        httpd.daemon_threads = True
         actual_host, actual_port = httpd.server_address[:2]
         print(f"MCP Streamable HTTP Server listening on http://{actual_host}:{actual_port}{endpoint}", flush=True)
-        httpd.serve_forever()
+        self._streamable_http_active = True
+        try:
+            httpd.serve_forever()
+        finally:
+            self._streamable_http_active = False
+            with self._streamable_http_lock:
+                for session in self._streamable_http_sessions.values():
+                    self._disconnect_streamable_http_session(session)
+                self._streamable_http_sessions.clear()
+            httpd.server_close()
 
     # ==== SSE (Server-Sent Events) HTTP transport ====
 
@@ -2649,25 +2950,33 @@ class MCPServer:
         i = 0
         while i < len(args):
             if args[i] in ("--port", "-p") and i + 1 < len(args):
-                port = int(args[i + 1]); i += 2
+                port = int(args[i + 1])
+                i += 2
             elif args[i] == "--host" and i + 1 < len(args):
-                host = args[i + 1]; i += 2
+                host = args[i + 1]
+                i += 2
             elif args[i] == "--endpoint" and i + 1 < len(args):
-                endpoint = args[i + 1]; i += 2
+                endpoint = args[i + 1]
+                i += 2
             elif args[i] == "--max-request-bytes" and i + 1 < len(args):
-                max_request_bytes = int(args[i + 1]); i += 2
+                max_request_bytes = int(args[i + 1])
+                i += 2
             elif args[i] == "--allowed-origin" and i + 1 < len(args):
-                allowed_origins.append(args[i + 1]); i += 2
+                allowed_origins.append(args[i + 1])
+                i += 2
             elif args[i] == "--transport" and i + 1 < len(args):
                 selected = args[i + 1]
                 if transport is not None and transport != selected:
                     raise ValueError("conflicting transport options")
-                transport = selected; i += 2
+                transport = selected
+                i += 2
             elif args[i] in ("--tcp", "--http", "--sse"):
                 selected = {"--tcp": "tcp", "--http": "streamable-http", "--sse": "sse"}[args[i]]
                 if transport is not None and transport != selected:
                     raise ValueError("conflicting transport options")
-                use_tcp = selected == "tcp"; transport = selected; i += 1
+                use_tcp = selected == "tcp"
+                transport = selected
+                i += 1
             else:
                 remaining.append(args[i])
                 i += 1
@@ -2681,9 +2990,23 @@ class MCPServer:
             raise ValueError("stdio transport cannot use --port")
         if port is not None:
             mode = transport or ("tcp" if use_tcp else "sse")
-            if mode == "tcp": self.run_socket(host=host, port=port)
-            elif mode == "streamable-http": self.run_streamable_http(host=host, port=port, endpoint=endpoint, allowed_origins=allowed_origins, max_request_bytes=max_request_bytes)
-            else: self.run_sse(host=host, port=port, allowed_origins=allowed_origins, max_request_bytes=max_request_bytes)
+            if mode == "tcp":
+                self.run_socket(host=host, port=port)
+            elif mode == "streamable-http":
+                self.run_streamable_http(
+                    host=host,
+                    port=port,
+                    endpoint=endpoint,
+                    allowed_origins=allowed_origins,
+                    max_request_bytes=max_request_bytes,
+                )
+            else:
+                self.run_sse(
+                    host=host,
+                    port=port,
+                    allowed_origins=allowed_origins,
+                    max_request_bytes=max_request_bytes,
+                )
             return
 
         # ---- Original stdio / file transport ----

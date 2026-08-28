@@ -38,11 +38,16 @@ if _os.name == "nt":
 _stdin_bin  = _sys.stdin.buffer
 _stdout_bin = _sys.stdout.buffer
 
+import math
+import re
 from asyncio import (
     CancelledError,
     Event,
     IncompleteReadError,
     Lock,
+    Queue,
+    QueueEmpty,
+    QueueFull,
     StreamReader,
     StreamWriter,
     current_task,
@@ -53,10 +58,10 @@ from asyncio import (
     wait_for,
 )
 from base64 import b64encode, urlsafe_b64decode, urlsafe_b64encode
+from collections.abc import Mapping
 from contextvars import copy_context
-from dataclasses import MISSING, asdict, fields, is_dataclass
+from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
 from enum import Enum
-import re
 from inspect import (
     Parameter,
     Signature,
@@ -67,50 +72,56 @@ from inspect import (
     ismethod,
     signature,
 )
-import math
-from json import JSONDecodeError, dumps, loads as _json_loads
+from json import JSONDecodeError, dumps
+from json import loads as _json_loads
 from logging import INFO, FileHandler, basicConfig, getLogger
 from pathlib import Path
 from sys import argv, exit
+from time import monotonic
 from types import UnionType
-from typing import Any, Literal, Mapping, Union, get_args, get_origin, get_type_hints, is_typeddict
-
+from typing import Any, Literal, Union, get_args, get_origin, get_type_hints, is_typeddict
 
 _STRUCTURED_UNSET = object()
 from urllib.parse import parse_qs
 from uuid import uuid4
 
 from umcp_shared import (
+    SUPPORTED_PROTOCOL_VERSIONS,
     MCPCancellationState,
     MCPHTTPResponse,
     MCPPrincipal,
     MCPRequestCancelled,
     MCPRequestContext,
     MCPRequestRuntime,
-    SUPPORTED_PROTOCOL_VERSIONS,
     content_type_is_json,
     exact_or_fallback,
-    get_progress_token as _get_progress_token,
     get_request_context,
     get_request_runtime,
     has_ambiguous_singleton_values,
     has_singleton_header_violations,
+    http_status_line,
     is_jsonrpc_object,
-    is_request_cancelled as _is_request_cancelled,
     is_valid_jsonrpc_id,
     is_valid_jsonrpc_response,
     media_accepts_event_stream,
     media_accepts_json,
-    http_status_line,
     origin_is_allowed,
     protocol_version_error,
-    raise_if_cancelled as _raise_if_cancelled,
     request_target_path,
     reset_request_context,
     reset_request_runtime,
     set_request_context,
     set_request_runtime,
     validate_http_response,
+)
+from umcp_shared import (
+    get_progress_token as _get_progress_token,
+)
+from umcp_shared import (
+    is_request_cancelled as _is_request_cancelled,
+)
+from umcp_shared import (
+    raise_if_cancelled as _raise_if_cancelled,
 )
 
 
@@ -142,6 +153,18 @@ async def notify_progress(progress: float | int, total: float | int | None = Non
     if isawaitable(result):
         await result
 
+
+@dataclass(slots=True)
+class _AsyncStreamableHTTPSession:
+    principal: str
+    protocol_version: str
+    created_at: float
+    last_seen: float
+    disconnect_event: Event
+    queue: Queue[bytes]
+    writer: StreamWriter | None = None
+
+
 class AsyncMCPServer:
     """Async MCP server implementation using JSON-RPC 2.0 protocol with asyncio."""
 
@@ -171,6 +194,13 @@ class AsyncMCPServer:
         # notification helpers can introspect it from any context.
         # session_id -> (writer, disconnect_event, write_lock, principal name)
         self._sse_sessions: dict[str, tuple[StreamWriter, Event, Lock, str]] = {}
+        self._streamable_http_sessions: dict[str, _AsyncStreamableHTTPSession] = {}
+        self.streamable_http_session_ttl_seconds = 30 * 60
+        self.streamable_http_keepalive_seconds = 15.0
+        self.streamable_http_request_timeout_seconds = 30.0
+        self.streamable_http_max_sessions = 1024
+        self.streamable_http_max_requests_per_connection = 1000
+        self._streamable_http_active = False
 
     def _setup_logging(self) -> None:
         """Set up logging configuration."""
@@ -214,7 +244,7 @@ class AsyncMCPServer:
             "protocolVersion": SUPPORTED_PROTOCOL_VERSIONS[0],
             "serverInfo": {
                 "name": self.__class__.__name__,
-                "version": "0.1.0"
+                "version": "0.2.2"
             },
             "capabilities": capabilities,
             "instructions": self.get_instructions()
@@ -1338,7 +1368,7 @@ class AsyncMCPServer:
         return self.create_response(request_id, result)
 
     async def _maybe_await(self, value: Any) -> Any:
-        if iscoroutinefunction(getattr(value, "__call__", None)):  # safety
+        if iscoroutinefunction(value):
             value = value()
         if hasattr(value, "__await__"):
             return await value
@@ -1477,6 +1507,30 @@ class AsyncMCPServer:
             self._resource_subscriptions.discard(uri)
         return self.create_response(request_id, {})
 
+    @staticmethod
+    def _disconnect_streamable_http_session(session: _AsyncStreamableHTTPSession) -> None:
+        session.disconnect_event.set()
+        try:
+            session.queue.put_nowait(b"")
+        except QueueFull:
+            try:
+                session.queue.get_nowait()
+            except QueueEmpty:
+                pass
+            session.queue.put_nowait(b"")
+
+    def _expire_streamable_http_sessions(self, now: float) -> None:
+        expired = [
+            session_id
+            for session_id, session in self._streamable_http_sessions.items()
+            if now - session.last_seen >= self.streamable_http_session_ttl_seconds
+        ]
+        for session_id in expired:
+            session = self._streamable_http_sessions.pop(session_id)
+            self._disconnect_streamable_http_session(session)
+            self._resource_session_subscriptions.pop(session_id, None)
+            self.logger.info("Streamable HTTP session %s expired", session_id)
+
     async def _send_notification_async(
         self,
         method: str,
@@ -1494,8 +1548,9 @@ class AsyncMCPServer:
             notification["params"] = params
         payload_text = dumps(notification)
 
+        sse_blob = f"event: message\ndata: {payload_text}\n\n".encode()
+        delivered_to_http = False
         if self._sse_sessions:
-            sse_blob = f"event: message\ndata: {payload_text}\n\n".encode()
             target_items = list(self._sse_sessions.items())
             if session_ids is not None:
                 target_items = [item for item in target_items if item[0] in session_ids]
@@ -1504,8 +1559,29 @@ class AsyncMCPServer:
                     async with write_lock:
                         writer.write(sse_blob)
                         await writer.drain()
+                    delivered_to_http = True
                 except Exception:  # noqa: BLE001
                     self.logger.debug("Dropping notification for stale SSE session %s", sid)
+
+        if self._streamable_http_active:
+            self._expire_streamable_http_sessions(monotonic())
+            target_items = list(self._streamable_http_sessions.items())
+            if session_ids is not None:
+                target_items = [item for item in target_items if item[0] in session_ids]
+            for sid, session in target_items:
+                if session.writer is None:
+                    continue
+                try:
+                    session.queue.put_nowait(sse_blob)
+                    delivered_to_http = True
+                except QueueFull:
+                    self.logger.warning(
+                        "Dropping Streamable HTTP notification because session %s queue is full",
+                        sid,
+                    )
+            return
+
+        if delivered_to_http:
             return
 
         try:
@@ -1770,7 +1846,8 @@ class AsyncMCPServer:
             result = request_hook(self, method="", path="", headers=headers, peer=str(peer) if peer is not None else None)
             if isawaitable(result):
                 close = getattr(result, "close", None)
-                if close: close()
+                if close:
+                    close()
                 raise TypeError("async authentication hook requires authenticate_async()")
             return result
         return MCPPrincipal(name="anonymous")
@@ -1781,7 +1858,8 @@ class AsyncMCPServer:
             result = request_hook(self, principal, rpc_method=method, tool_name=(params.get("name") if isinstance(params, Mapping) else None))
             if isawaitable(result):
                 close = getattr(result, "close", None)
-                if close: close()
+                if close:
+                    close()
                 raise TypeError("async authorization hook requires authorize_async()")
             return result
         return True
@@ -2364,203 +2442,494 @@ class AsyncMCPServer:
         addrs = [s.getsockname() for s in server.sockets]
         for addr in addrs:
             print(f"MCP Streamable HTTP Server listening on http://{addr[0]}:{addr[1]}{endpoint}", flush=True)
-        async with server:
-            await server.serve_forever()
+        self._streamable_http_active = True
+        try:
+            async with server:
+                await server.serve_forever()
+        finally:
+            self._streamable_http_active = False
+            for session in self._streamable_http_sessions.values():
+                self._disconnect_streamable_http_session(session)
+            self._streamable_http_sessions.clear()
 
     async def _handle_streamable_http_client(self, reader: StreamReader, writer: StreamWriter, endpoint: str, allowed_origins: list[str], max_request_bytes: int, host: str = "127.0.0.1") -> None:
         peer = writer.get_extra_info("peername")
 
-        async def send_response(status: str | int, *, body: bytes = b"", content_type: str | None = None, allow: str | None = None, www_authenticate: str | None = None, origin: str | None = None, extra_headers: tuple[tuple[str, str], ...] = ()) -> None:
-            status_line = http_status_line(status) if isinstance(status, int) else status
-            response = [f"HTTP/1.1 {status_line}\r\n".encode()]
-            if content_type:
-                response.append(f"Content-Type: {content_type}\r\n".encode())
-            if allow:
-                response.append(f"Allow: {allow}\r\n".encode())
-            if www_authenticate:
-                response.append(f"WWW-Authenticate: {www_authenticate}\r\n".encode())
-            if origin:
-                response.append(f"Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n".encode())
-            for key, value in extra_headers:
-                response.append(f"{key}: {value}\r\n".encode())
-            response.append(f"Content-Length: {len(body)}\r\n\r\n".encode())
-            if body:
-                response.append(body)
-            writer.write(b"".join(response))
-            await writer.drain()
+        async def handle_one_request(request_number: int) -> bool:
+            keep_alive = False
+            request_version = "HTTP/1.1"
 
-        try:
+            async def send_response(
+                status: str,
+                *,
+                body: bytes = b"",
+                content_type: str | None = None,
+                allow: str | None = None,
+                www_authenticate: str | None = None,
+                origin: str | None = None,
+                extra_headers: tuple[tuple[str, str], ...] = (),
+                force_close: bool = False,
+                streaming: bool = False,
+            ) -> None:
+                nonlocal keep_alive
+                if force_close or request_number >= self.streamable_http_max_requests_per_connection:
+                    keep_alive = False
+                response = [f"HTTP/1.1 {status}\r\n".encode()]
+                if content_type:
+                    response.append(f"Content-Type: {content_type}\r\n".encode())
+                if allow:
+                    response.append(f"Allow: {allow}\r\n".encode())
+                if www_authenticate:
+                    response.append(f"WWW-Authenticate: {www_authenticate}\r\n".encode())
+                if origin:
+                    response.append(f"Access-Control-Allow-Origin: {origin}\r\n".encode())
+                    response.append(b"Access-Control-Expose-Headers: Mcp-Session-Id\r\n")
+                    response.append(b"Vary: Origin\r\n")
+                for key, value in extra_headers:
+                    response.append(f"{key}: {value}\r\n".encode())
+                if not keep_alive:
+                    response.append(b"Connection: close\r\n")
+                elif request_version == "HTTP/1.0":
+                    response.append(b"Connection: keep-alive\r\n")
+                if not streaming:
+                    response.append(f"Content-Length: {len(body)}\r\n".encode())
+                response.append(b"\r\n")
+                if body:
+                    response.append(body)
+                writer.write(b"".join(response))
+                await writer.drain()
+
+            async def send_json(
+                payload: dict[str, Any],
+                status: str = "200 OK",
+                *,
+                origin: str | None = None,
+                extra_headers: tuple[tuple[str, str], ...] = (),
+            ) -> None:
+                await send_response(
+                    status,
+                    body=dumps(payload).encode(),
+                    content_type="application/json",
+                    origin=origin,
+                    extra_headers=extra_headers,
+                )
+
             try:
-                line = await wait_for(reader.readline(), timeout=30.0)
-                if not line or len(line) > 8192:
-                    raise ValueError("invalid request line")
-                method, path, http_version = line.decode("ascii", errors="strict").strip().split(" ")
-                if http_version not in {"HTTP/1.0", "HTTP/1.1"}:
-                    raise ValueError("unsupported HTTP version")
-                headers: dict[str, str] = {}
-                header_counts: dict[str, int] = {}
-                header_bytes = 0
-                for _ in range(100):
-                    h = await wait_for(reader.readline(), timeout=30.0)
-                    header_bytes += len(h)
-                    if header_bytes > 65536:
-                        raise ValueError("headers too large")
-                    if h in (b"\r\n", b"\n"):
-                        break
-                    if not h or b":" not in h:
-                        raise ValueError("invalid header")
-                    k, v = h.decode("iso-8859-1").split(":", 1)
-                    key = k.strip().lower()
-                    headers[key] = v.strip()
-                    header_counts[key] = header_counts.get(key, 0) + 1
-                else:
-                    raise ValueError("too many headers")
-            except (ValueError, UnicodeError, TimeoutError):
-                await send_response("400 Bad Request")
-                return
-            origin = headers.get("origin")
-            allowed_origin = origin if origin and origin_is_allowed(origin, allowed_origins, local_bind=host in ("127.0.0.1", "localhost", "::1"), request_authority=headers.get("host")) else None
-            if origin and not allowed_origin:
-                await send_response("403 Forbidden")
-                return
-            if (
-                has_singleton_header_violations(header_counts, http_version=http_version)
-                or has_ambiguous_singleton_values(headers)
-            ):
-                await send_response("400 Bad Request", origin=allowed_origin)
-                return
-            if headers.get("transfer-encoding"):
-                await send_response("400 Bad Request", origin=allowed_origin)
-                return
+                request_line = await wait_for(
+                    reader.readline(),
+                    timeout=self.streamable_http_request_timeout_seconds,
+                )
+            except (TimeoutError, ConnectionError, OSError):
+                return False
+            if not request_line:
+                return False
+            if len(request_line) > 8192:
+                await send_response("414 URI Too Long", force_close=True)
+                return False
             try:
-                n = int(headers.get("content-length", "0") or "0")
-            except ValueError:
-                await send_response("400 Bad Request", origin=allowed_origin)
-                return
-            if n < 0:
-                await send_response("400 Bad Request", origin=allowed_origin)
-                return
-            if n > max_request_bytes:
-                await send_response("413 Payload Too Large", origin=allowed_origin)
-                return
-            try:
-                body = await wait_for(reader.readexactly(n), timeout=30.0) if n else b""
-            except (TimeoutError, IncompleteReadError):
-                await send_response("400 Bad Request", origin=allowed_origin)
-                return
-            request_path = request_target_path(path)
-            if request_path != endpoint:
+                method, target, request_version = request_line.decode("ascii").strip().split()
+            except (UnicodeDecodeError, ValueError):
+                await send_response("400 Bad Request", force_close=True)
+                return False
+            if request_version not in ("HTTP/1.0", "HTTP/1.1"):
+                await send_response("400 Bad Request", force_close=True)
+                return False
+
+            header_lines: list[bytes] = []
+            total_header_bytes = 0
+            while True:
                 try:
-                    hook_response = await self.handle_http_request_async(
+                    line = await wait_for(
+                        reader.readline(),
+                        timeout=self.streamable_http_request_timeout_seconds,
+                    )
+                except (TimeoutError, ConnectionError, OSError):
+                    await send_response("400 Bad Request", force_close=True)
+                    return False
+                total_header_bytes += len(line)
+                if not line or total_header_bytes > 65536 or len(header_lines) > 100:
+                    await send_response("400 Bad Request", force_close=True)
+                    return False
+                if line in (b"\r\n", b"\n"):
+                    break
+                if line[:1] in (b" ", b"\t"):
+                    await send_response("400 Bad Request", force_close=True)
+                    return False
+                header_lines.append(line)
+
+            headers: dict[str, str] = {}
+            header_counts: dict[str, int] = {}
+            try:
+                for line in header_lines:
+                    name_raw, value_raw = line.split(b":", 1)
+                    name = name_raw.decode("ascii").strip().lower()
+                    if not name:
+                        raise ValueError
+                    value = value_raw.decode("iso-8859-1").strip()
+                    header_counts[name] = header_counts.get(name, 0) + 1
+                    headers[name] = f"{headers[name]}, {value}" if name in headers else value
+            except (UnicodeDecodeError, ValueError):
+                await send_response("400 Bad Request", force_close=True)
+                return False
+
+            connection_tokens = {
+                token.strip().lower()
+                for token in headers.get("connection", "").split(",")
+                if token.strip()
+            }
+            keep_alive = (
+                request_version == "HTTP/1.1" and "close" not in connection_tokens
+            ) or (
+                request_version == "HTTP/1.0"
+                and "keep-alive" in connection_tokens
+                and "close" not in connection_tokens
+            )
+            origin = headers.get("origin")
+            allowed_origin = None
+            if origin and header_counts.get("origin") == 1:
+                if origin_is_allowed(
+                    origin,
+                    allowed_origins,
+                    local_bind=host in ("127.0.0.1", "localhost", "::1"),
+                    request_authority=headers.get("host"),
+                ):
+                    allowed_origin = origin
+            if (
+                has_singleton_header_violations(header_counts, http_version=request_version)
+                or has_ambiguous_singleton_values(headers)
+                or "transfer-encoding" in headers
+            ):
+                await send_response("400 Bad Request", origin=allowed_origin, force_close=True)
+                return False
+            if origin and not allowed_origin:
+                await send_response("403 Forbidden", force_close=True)
+                return False
+
+            try:
+                content_length = int(headers.get("content-length", "0"))
+            except ValueError:
+                await send_response("400 Bad Request", origin=allowed_origin, force_close=True)
+                return False
+            if content_length < 0:
+                await send_response("400 Bad Request", origin=allowed_origin, force_close=True)
+                return False
+            if content_length > max_request_bytes:
+                await send_response("413 Payload Too Large", origin=allowed_origin, force_close=True)
+                return False
+            try:
+                body = (
+                    await wait_for(
+                        reader.readexactly(content_length),
+                        timeout=self.streamable_http_request_timeout_seconds,
+                    )
+                    if content_length
+                    else b""
+                )
+            except (IncompleteReadError, TimeoutError, ConnectionError, OSError):
+                await send_response("400 Bad Request", origin=allowed_origin, force_close=True)
+                return False
+
+            path = request_target_path(target)
+            if path != endpoint:
+                try:
+                    response = await self.handle_http_request_async(
                         method=method,
-                        path=request_path,
+                        path=path,
                         headers=headers,
                         body=body,
                         peer=peer[0] if peer else None,
                     )
                 except Exception:
-                    self.logger.exception("HTTP auxiliary route hook failed for %s %s", method, request_path)
+                    self.logger.exception("HTTP auxiliary route hook failed for %s %s", method, path)
                     await send_response("500 Internal Server Error", origin=allowed_origin)
-                    return
-                if hook_response is None:
-                    await send_response("405 Method Not Allowed", allow="POST, OPTIONS", origin=allowed_origin)
-                    return
-                validated = self._validate_http_route_response(hook_response, max_request_bytes=max_request_bytes)
+                    return keep_alive
+                if response is None:
+                    await send_response(
+                        "405 Method Not Allowed",
+                        allow="GET, POST, DELETE, OPTIONS",
+                        origin=allowed_origin,
+                    )
+                    return keep_alive
+                validated = self._validate_http_route_response(response, max_request_bytes=max_request_bytes)
                 if validated is None:
-                    self.logger.error("HTTP auxiliary route hook returned invalid response: %r", hook_response)
+                    self.logger.error("HTTP auxiliary route hook returned invalid response: %r", response)
                     await send_response("500 Internal Server Error", origin=allowed_origin)
-                    return
-                await send_response(validated.status, body=validated.body, content_type=validated.content_type, origin=allowed_origin, extra_headers=validated.headers)
-                return
+                    return keep_alive
+                await send_response(
+                    http_status_line(validated.status),
+                    body=validated.body,
+                    content_type=validated.content_type,
+                    origin=allowed_origin,
+                    extra_headers=validated.headers,
+                )
+                return keep_alive
+
             if method == "OPTIONS":
                 if not origin:
-                    await send_response("405 Method Not Allowed", allow="POST, OPTIONS", origin=allowed_origin)
-                    return
-                await send_response("204 No Content", origin=allowed_origin, extra_headers=(("Access-Control-Allow-Methods", "POST, OPTIONS"), ("Access-Control-Allow-Headers", "Content-Type, Accept, MCP-Protocol-Version, Authorization")))
-                return
-            if method != "POST":
-                await send_response("405 Method Not Allowed", allow="POST, OPTIONS", origin=allowed_origin)
-                return
-            if not content_type_is_json(headers.get("content-type")):
-                await send_response("415 Unsupported Media Type", origin=allowed_origin)
-                return
-            if not media_accepts_json(headers.get("accept")):
-                await send_response("406 Not Acceptable", origin=allowed_origin)
-                return
+                    await send_response(
+                        "405 Method Not Allowed",
+                        allow="GET, POST, DELETE, OPTIONS",
+                        origin=allowed_origin,
+                    )
+                    return keep_alive
+                await send_response(
+                    "204 No Content",
+                    origin=allowed_origin,
+                    extra_headers=(
+                        ("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"),
+                        ("Access-Control-Allow-Headers", "Content-Type, Accept, MCP-Protocol-Version, Mcp-Session-Id, Last-Event-ID, Authorization"),
+                    ),
+                )
+                return keep_alive
+
+            if method not in ("GET", "POST", "DELETE"):
+                await send_response(
+                    "405 Method Not Allowed",
+                    allow="GET, POST, DELETE, OPTIONS",
+                    origin=allowed_origin,
+                )
+                return keep_alive
+
             try:
-                principal = await self.authenticate_request_async(method="POST", path=path, headers=headers, peer=peer[0] if peer else None)
+                principal = await self.authenticate_request_async(
+                    method=method,
+                    path=target,
+                    headers=headers,
+                    peer=peer[0] if peer else None,
+                )
             except Exception:
-                self.logger.exception("HTTP authentication hook failed for POST %s", path)
+                self.logger.exception("HTTP authentication hook failed for %s %s", method, target)
                 await send_response("500 Internal Server Error", origin=allowed_origin)
-                return
+                return keep_alive
             if not self._validate_http_principal(principal):
                 self.logger.error("HTTP authentication hook returned invalid principal type: %r", type(principal))
                 await send_response("500 Internal Server Error", origin=allowed_origin)
-                return
+                return keep_alive
             if principal is None:
-                await send_response("401 Unauthorized", www_authenticate="Bearer", origin=allowed_origin)
-                return
-            try:
-                req = loads(body.decode("utf-8"))
-            except (UnicodeDecodeError, JSONDecodeError):
-                resp = self.create_response(None, None, self.create_error(-32700, "Parse error"))
-                await send_response("200 OK", body=(dumps(resp) + "\n").encode(), content_type="application/json", origin=allowed_origin)
-                return
-            if not isinstance(req, dict):
-                resp = self.create_response(None, None, self.create_error(-32600, "Invalid Request"))
-                await send_response("200 OK", body=dumps(resp).encode(), content_type="application/json", origin=allowed_origin)
-                return
-            rpc_method = req.get("method")
-            version = headers.get("mcp-protocol-version")
-            if rpc_method != "initialize" and version not in SUPPORTED_PROTOCOL_VERSIONS:
                 await send_response(
-                    "400 Bad Request",
-                    body=dumps(protocol_version_error(version)).encode("utf-8"),
-                    content_type="application/json",
+                    "401 Unauthorized",
+                    www_authenticate="Bearer",
                     origin=allowed_origin,
                 )
-                return
-            is_response = (
-                rpc_method is None
-                and "id" in req
-                and is_valid_jsonrpc_response(req)
-            )
-            is_notification = rpc_method is not None and "id" not in req
+                return keep_alive
+
+            async def validated_session(
+                protocol_version: str,
+                *,
+                required: bool,
+            ) -> tuple[str, _AsyncStreamableHTTPSession] | None:
+                session_id = headers.get("mcp-session-id")
+                if not session_id:
+                    if required:
+                        await send_response("400 Bad Request", origin=allowed_origin)
+                    return None
+                self._expire_streamable_http_sessions(monotonic())
+                session = self._streamable_http_sessions.get(session_id)
+                if session is None:
+                    await send_response("404 Not Found", origin=allowed_origin)
+                    return None
+                if session.principal != principal.name:
+                    await send_response("403 Forbidden", origin=allowed_origin)
+                    return None
+                if session.protocol_version != protocol_version:
+                    await send_json(protocol_version_error(protocol_version), "400 Bad Request", origin=allowed_origin)
+                    return None
+                session.last_seen = monotonic()
+                return session_id, session
+
+            if method == "GET":
+                if not media_accepts_event_stream(headers.get("accept")):
+                    await send_response("406 Not Acceptable", origin=allowed_origin)
+                    return keep_alive
+                version = headers.get("mcp-protocol-version")
+                if version not in SUPPORTED_PROTOCOL_VERSIONS:
+                    await send_json(protocol_version_error(version), "400 Bad Request", origin=allowed_origin)
+                    return keep_alive
+                session_id = headers.get("mcp-session-id")
+                validated = await validated_session(version, required=True)
+                if validated is None:
+                    return keep_alive
+                _validated_id, session = validated
+                if session.writer is not None:
+                    await send_response("409 Conflict", origin=allowed_origin)
+                    return keep_alive
+                while True:
+                    try:
+                        session.queue.get_nowait()
+                    except QueueEmpty:
+                        break
+                session.disconnect_event.clear()
+                session.writer = writer
+                await send_response(
+                    "200 OK",
+                    content_type="text/event-stream",
+                    origin=allowed_origin,
+                    extra_headers=(("Cache-Control", "no-cache"),),
+                    streaming=True,
+                )
+                writer.write(b": connected\n\n")
+                await writer.drain()
+                try:
+                    while not session.disconnect_event.is_set():
+                        try:
+                            payload = await wait_for(
+                                session.queue.get(),
+                                timeout=self.streamable_http_keepalive_seconds,
+                            )
+                        except TimeoutError:
+                            payload = b": keepalive\n\n"
+                        if session.disconnect_event.is_set() or session.writer is not writer:
+                            break
+                        writer.write(payload)
+                        await writer.drain()
+                        session.last_seen = monotonic()
+                except (CancelledError, ConnectionError, OSError):
+                    pass
+                finally:
+                    if session.writer is writer:
+                        session.writer = None
+                        session.last_seen = monotonic()
+                    self.logger.info("Streamable HTTP event stream %s disconnected", session_id)
+                return False
+
+            if method == "DELETE":
+                version = headers.get("mcp-protocol-version")
+                if version not in SUPPORTED_PROTOCOL_VERSIONS:
+                    await send_json(protocol_version_error(version), "400 Bad Request", origin=allowed_origin)
+                    return keep_alive
+                validated = await validated_session(version, required=True)
+                if validated is None:
+                    return keep_alive
+                session_id, session = validated
+                if self._streamable_http_sessions.get(session_id) is not session:
+                    await send_response("404 Not Found", origin=allowed_origin)
+                    return keep_alive
+                self._streamable_http_sessions.pop(session_id, None)
+                self._disconnect_streamable_http_session(session)
+                self._resource_session_subscriptions.pop(session_id, None)
+                self.logger.info("Streamable HTTP session %s deleted", session_id)
+                await send_response("200 OK", origin=allowed_origin)
+                return keep_alive
+
+            if not content_type_is_json(headers.get("content-type")):
+                await send_response("415 Unsupported Media Type", origin=allowed_origin)
+                return keep_alive
+            if not media_accepts_json(headers.get("accept")):
+                await send_response("406 Not Acceptable", origin=allowed_origin)
+                return keep_alive
+            try:
+                request_obj = loads(body.decode())
+            except (UnicodeDecodeError, JSONDecodeError):
+                await send_json(
+                    {"jsonrpc": "2.0", "error": self.create_error(-32700, "Parse error"), "id": None},
+                    origin=allowed_origin,
+                )
+                return keep_alive
+            if not isinstance(request_obj, dict):
+                await send_json(
+                    self.create_response(None, None, self.create_error(-32600, "Invalid Request")),
+                    origin=allowed_origin,
+                )
+                return keep_alive
+
+            rpc_method = request_obj.get("method")
+            version = headers.get("mcp-protocol-version")
+            if rpc_method != "initialize" and version not in SUPPORTED_PROTOCOL_VERSIONS:
+                await send_json(protocol_version_error(version), "400 Bad Request", origin=allowed_origin)
+                return keep_alive
+            validated: tuple[str, _AsyncStreamableHTTPSession] | None = None
+            if rpc_method == "initialize":
+                if headers.get("mcp-session-id"):
+                    await send_response("400 Bad Request", origin=allowed_origin)
+                    return keep_alive
+            else:
+                validated = await validated_session(version, required=False)
+                if headers.get("mcp-session-id") and validated is None:
+                    return keep_alive
+
+            session_id = validated[0] if rpc_method != "initialize" and validated is not None else None
+            is_response = rpc_method is None and "id" in request_obj and is_valid_jsonrpc_response(request_obj)
+            is_notification = rpc_method is not None and "id" not in request_obj
             if is_response:
                 await send_response("202 Accepted", origin=allowed_origin)
-                return
-            params = req.get("params") if isinstance(req.get("params"), dict) else {}
+                return keep_alive
+            params = request_obj.get("params") if isinstance(request_obj.get("params"), dict) else {}
             tool_name = params.get("name") if rpc_method == "tools/call" else None
             try:
-                authorized = await self.authorize_request_async(principal, rpc_method=rpc_method, tool_name=tool_name)
+                authorized = await self.authorize_request_async(
+                    principal,
+                    rpc_method=rpc_method,
+                    tool_name=tool_name,
+                )
             except Exception:
                 self.logger.exception("HTTP authorization hook failed for rpc_method=%r tool_name=%r", rpc_method, tool_name)
                 await send_response("500 Internal Server Error", origin=allowed_origin)
-                return
+                return keep_alive
             if not self._validate_http_authorization_result(authorized):
                 self.logger.error("HTTP authorization hook returned invalid result type: %r", type(authorized))
                 await send_response("500 Internal Server Error", origin=allowed_origin)
-                return
+                return keep_alive
             if not authorized:
                 await send_response("403 Forbidden", origin=allowed_origin)
-                return
-            context = MCPRequestContext(transport="streamable-http", request_id=req.get("id"), protocol_version=version, session_id=None, principal=principal.name if principal else None, peer=peer[0] if peer else None, headers=headers)
-            response = await self.process_request_async(dumps(req), context=context)
+                return keep_alive
+            if session_id and rpc_method in ("resources/subscribe", "resources/unsubscribe"):
+                request_obj["params"] = dict(params)
+                request_obj["params"]["_session_id"] = session_id
+
+            context = MCPRequestContext(
+                transport="streamable-http",
+                request_id=request_obj.get("id"),
+                protocol_version=version,
+                session_id=session_id,
+                principal=principal.name,
+                peer=peer[0] if peer else None,
+                headers=headers,
+            )
+            response = await self.process_request_async(dumps(request_obj), context=context)
             if is_notification:
                 response = None
             if response is None:
                 await send_response("202 Accepted", origin=allowed_origin)
-                return
-            await send_response("200 OK", body=(dumps(response) + "\n").encode(), content_type="application/json", origin=allowed_origin)
+                return keep_alive
+
+            extra_headers: tuple[tuple[str, str], ...] = ()
+            if rpc_method == "initialize" and "result" in response:
+                result = response.get("result")
+                negotiated = result.get("protocolVersion") if isinstance(result, dict) else None
+                if negotiated in SUPPORTED_PROTOCOL_VERSIONS:
+                    now = monotonic()
+                    self._expire_streamable_http_sessions(now)
+                    if len(self._streamable_http_sessions) >= self.streamable_http_max_sessions:
+                        await send_response("503 Service Unavailable", origin=allowed_origin)
+                        return keep_alive
+                    created_id = str(uuid4())
+                    self._streamable_http_sessions[created_id] = _AsyncStreamableHTTPSession(
+                        principal=principal.name,
+                        protocol_version=negotiated,
+                        created_at=now,
+                        last_seen=now,
+                        disconnect_event=Event(),
+                        queue=Queue(maxsize=100),
+                    )
+                    self.logger.info("Streamable HTTP session %s created for %s", created_id, principal.name)
+                    extra_headers = (("Mcp-Session-Id", created_id),)
+            await send_json(response, origin=allowed_origin, extra_headers=extra_headers)
+            return keep_alive
+
+        try:
+            for request_number in range(1, self.streamable_http_max_requests_per_connection + 1):
+                if not await handle_one_request(request_number):
+                    break
+        except (CancelledError, ConnectionError, OSError):
+            pass
+        except Exception:
+            self.logger.exception("Streamable HTTP connection failed for %s", peer)
         finally:
-            if not writer.is_closing():
-                writer.close()
-            wait_closed = getattr(writer, "wait_closed", None)
-            if wait_closed is not None:
-                try:
-                    await wait_closed()
-                except Exception:
-                    pass
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
 
     async def run_sse_async(self, host: str = "127.0.0.1", port: int = 0, allowed_origins: list[str] | None = None, max_request_bytes: int = 4 * 1024 * 1024) -> None:
         allowed_origins = allowed_origins or []
@@ -2587,27 +2956,36 @@ class AsyncMCPServer:
         i = 0
         while i < len(args):
             if args[i] in ("--port", "-p") and i + 1 < len(args):
-                port = int(args[i + 1]); i += 2
+                port = int(args[i + 1])
+                i += 2
             elif args[i] == "--host" and i + 1 < len(args):
-                host = args[i + 1]; i += 2
+                host = args[i + 1]
+                i += 2
             elif args[i] == "--endpoint" and i + 1 < len(args):
-                endpoint = args[i + 1]; i += 2
+                endpoint = args[i + 1]
+                i += 2
             elif args[i] == "--max-request-bytes" and i + 1 < len(args):
-                max_request_bytes = int(args[i + 1]); i += 2
+                max_request_bytes = int(args[i + 1])
+                i += 2
             elif args[i] == "--allowed-origin" and i + 1 < len(args):
-                allowed_origins.append(args[i + 1]); i += 2
+                allowed_origins.append(args[i + 1])
+                i += 2
             elif args[i] == "--transport" and i + 1 < len(args):
                 selected = args[i + 1]
                 if transport is not None and transport != selected:
                     raise ValueError("conflicting transport options")
-                transport = selected; i += 2
+                transport = selected
+                i += 2
             elif args[i] in ("--tcp", "--http", "--sse"):
                 selected = {"--tcp": "tcp", "--http": "streamable-http", "--sse": "sse"}[args[i]]
                 if transport is not None and transport != selected:
                     raise ValueError("conflicting transport options")
-                use_tcp = selected == "tcp"; transport = selected; i += 1
+                use_tcp = selected == "tcp"
+                transport = selected
+                i += 1
             else:
-                remaining.append(args[i]); i += 1
+                remaining.append(args[i])
+                i += 1
         valid_transports = {"stdio", "streamable-http", "sse", "tcp"}
         if transport not in valid_transports | {None}:
             raise ValueError(f"unsupported transport: {transport}")
@@ -2631,20 +3009,25 @@ class AsyncMCPServer:
                     input_data = f.read()
                 response = await self.process_request_async(input_data, context=MCPRequestContext(transport="file"))
                 if response is not None:
-                    payload = (dumps(response) + "\n").encode('utf-8')
-                    _stdout_bin.write(payload); _stdout_bin.flush()
+                    payload = (dumps(response) + "\n").encode("utf-8")
+                    _stdout_bin.write(payload)
+                    _stdout_bin.flush()
             except OSError as e:
-                self.logger.error("Error reading file %s: %s", args[0], e); exit(1)
+                self.logger.error("Error reading file %s: %s", args[0], e)
+                exit(1)
         else:
             while True:
                 raw = await get_event_loop().run_in_executor(None, _stdin_bin.readline)
-                if not raw: break
-                line = raw.decode('utf-8', errors='replace').strip()
-                if not line: continue
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
                 response = await self.process_request_async(line, context=MCPRequestContext(transport="stdio"))
                 if response is not None:
-                    payload = (dumps(response) + "\n").encode('utf-8')
-                    _stdout_bin.write(payload); _stdout_bin.flush()
+                    payload = (dumps(response) + "\n").encode("utf-8")
+                    _stdout_bin.write(payload)
+                    _stdout_bin.flush()
 
     def run(self, args: list[str] | None = None) -> None:
         """Synchronous wrapper to run the async MCP server."""

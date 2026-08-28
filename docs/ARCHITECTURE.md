@@ -72,28 +72,40 @@ buffering before any I/O happens, because the default text-mode CRLF
 translation on Windows will corrupt JSON-RPC framing in subtle ways.
 
 **Streamable HTTP** (`--port N --http`, or `--transport streamable-http`).
-A stateless `POST /mcp` accepts one JSON-RPC message and returns either a
-JSON response (`200`) or an empty notification acknowledgement (`202`).
+A `POST /mcp` accepts one JSON-RPC message and returns either a JSON response
+(`200`) or an empty notification acknowledgement (`202`). HTTP/1.1 connections
+persist for sequential requests unless closure is requested or safe parsing
+cannot continue; HTTP/1.0 closes by default and supports explicit keep-alive.
+Separate connections are served concurrently.
+
+A successful `initialize` issues an opaque `Mcp-Session-Id` bound to the
+authenticated principal and negotiated protocol version. Session-bound
+`GET /mcp` opens one server-sent event stream for notifications, and
+`DELETE /mcp` closes the stream and removes the session. Sessions expire after
+30 minutes of inactivity and are bounded to 1,024 live entries. A stream may
+reconnect while its session is alive, but notifications are not replayed.
+Stateless POST remains available for backwards compatibility. The complete
+connection, status-code, session, SSE, and CORS rules are documented in
+[`STREAMABLE_HTTP.md`](STREAMABLE_HTTP.md).
+
 Endpoint matching is done on the URL path, so `/mcp?debug=1` is accepted and
-treated the same as `/mcp`. `GET` and `DELETE` return `405` because this
-implementation has no stateful sessions or server-initiated stream. `OPTIONS`
-is only enabled for actual browser preflight requests carrying an allowed
-`Origin`, and only on the configured endpoint path; stray or proxy-generated
-`OPTIONS` without `Origin` get `405`, and disallowed Origins get `403`.
-HTTP/1.1 requires exactly one `Host` header, while HTTP/1.0 may omit it.
-Duplicate `Host`, `Authorization`, `Origin`, `Accept`, `Content-Type`,
-`MCP-Protocol-Version`, `Content-Length`, and `Transfer-Encoding` headers are
-rejected with `400`; any `Transfer-Encoding` is rejected outright.
-Non-initialize requests must carry a supported `MCP-Protocol-Version`. The
-transport validates media types, response negotiation, Origins,
-authentication/authorization hooks, and a 4 MiB default body limit, with
-deterministic `400` handling for malformed or short request bodies. Hook
-exceptions and invalid hook return types are logged server-side and surfaced
-remotely as generic `500`s. It binds to loopback unless `--host` is
-explicitly supplied. Remote deployments should override
-`authenticate_request()` and `authorize_request()` or put the service behind a
-trusted authenticating reverse proxy. Session IDs, if added later, are
-routing identifiers rather than credentials.
+treated the same as `/mcp`. `OPTIONS` is only enabled for actual browser
+preflight requests carrying an allowed `Origin`, and only on the configured
+endpoint path; stray or proxy-generated `OPTIONS` without `Origin` get `405`,
+and disallowed Origins get `403`. HTTP/1.1 requires exactly one `Host` header,
+while HTTP/1.0 may omit it. Duplicate `Host`, `Authorization`, `Origin`,
+`Accept`, `Content-Type`, `MCP-Protocol-Version`, `Mcp-Session-Id`,
+`Content-Length`, and `Transfer-Encoding` headers are rejected with `400`; any
+`Transfer-Encoding` is rejected outright. Non-initialize requests must carry
+a supported `MCP-Protocol-Version`. The transport validates media types,
+response negotiation, Origins, authentication/authorization hooks, and a
+4 MiB default body limit, with deterministic `400` handling for malformed or
+short request bodies. Hook exceptions and invalid hook return types are logged
+server-side and surfaced remotely as generic `500`s. It binds to loopback
+unless `--host` is explicitly supplied. Remote deployments should override
+`authenticate_request()` and `authorize_request()` or put the service behind
+a trusted authenticating reverse proxy. Session IDs are routing identifiers,
+not credentials.
 
 Request metadata is exposed safely through `get_request_context()`, backed
 by `contextvars`, so concurrent threads and asyncio tasks cannot overwrite

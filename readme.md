@@ -13,7 +13,7 @@ thing readable in an afternoon.
 
 The runtime is three files: `umcp.py`, `aioumcp.py`, and the shared
 `umcp_shared.py`. It has no third-party runtime dependencies, supports
-stdio, stateless Streamable HTTP, legacy HTTP+SSE, and raw TCP, and ships
+stdio, session-aware Streamable HTTP, legacy HTTP+SSE, and raw TCP, and ships
 with a handful of runnable examples in [`examples/`](examples/).
 
 ---
@@ -113,7 +113,7 @@ Streamable HTTP explicitly.
 | Transport | Invocation | Intended use |
 |---|---|---|
 | stdio | `python server.py` | Local child-process integrations |
-| Streamable HTTP | `python server.py --port 9000 --http` | New network services; stateless `POST /mcp` |
+| Streamable HTTP | `python server.py --port 9000 --http` | New network services; persistent POST plus session-bound SSE |
 | legacy SSE | `python server.py --port 9000 --sse` | Existing HTTP+SSE clients; deprecated, with no removal date |
 | raw TCP | `python server.py --port 9000 --tcp` | Legacy compatibility only |
 
@@ -129,16 +129,27 @@ MCP clients should still perform the normal initialize handshake.
 
 Streamable HTTP accepts one JSON-RPC object per `POST`. Requests return
 `200 application/json`; notifications and client responses return `202`.
-The initial `initialize` negotiates either `2025-03-26` or `2024-11-05`.
-Later requests must send a supported value in `MCP-Protocol-Version`. A missing or unsupported value returns `400 application/json` with the preferred and supported protocol versions rather than an empty response.
+HTTP/1.1 connections remain open for sequential requests unless either peer
+requests closure, framing becomes unsafe, or the idle/request-count limits are
+reached. HTTP/1.0 closes by default and supports explicit keep-alive.
+
+A successful `initialize` negotiates either `2025-03-26` or `2024-11-05`
+and returns an opaque `Mcp-Session-Id`. Later session requests bind that ID to
+the authenticated principal and negotiated version. `GET /mcp` opens one
+server-sent event stream for notifications; `DELETE /mcp` closes and removes
+the session. Clients may reconnect the stream while the session remains live,
+but events emitted during a gap are not replayed. Requests without a session
+remain available for backwards compatibility.
+
 Request targets are matched on the URL path, so `/mcp?trace=1` is accepted
 and treated the same as `/mcp`. HTTP/1.1 requires exactly one `Host` header;
 HTTP/1.0 may omit it. Duplicate `Host`, `Authorization`, `Origin`, `Accept`,
-`Content-Type`, `MCP-Protocol-Version`, `Content-Length`, or
+`Content-Type`, `MCP-Protocol-Version`, `Mcp-Session-Id`, `Content-Length`, or
 `Transfer-Encoding` headers are rejected with `400`, and any
-`Transfer-Encoding` is rejected. Stateless `GET` and `DELETE` return `405`.
-Browser preflight is only enabled for an allowed `Origin`, and only on the
-configured endpoint path.
+`Transfer-Encoding` is rejected. Browser preflight is only enabled for an
+allowed `Origin` on the configured endpoint and exposes the session header.
+See the detailed [Streamable HTTP contract](docs/STREAMABLE_HTTP.md) for
+status codes, lifetime limits, SSE semantics, and CORS behaviour.
 
 ---
 

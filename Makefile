@@ -28,7 +28,7 @@ help:
 	@echo "  test-fast     -- run the suite with -x and quiet output"
 	@echo "  coverage      -- run the suite under coverage and print a report"
 	@echo "  coverage-html -- run the suite under coverage and emit htmlcov/"
-	@echo "  lint          -- run ruff (if installed) over umcp.py / aioumcp.py"
+	@echo "  lint          -- run ruff (if installed) over the runtime modules"
 	@echo "  clean         -- remove caches, coverage data, log files"
 	@echo "  install       -- install umcp into the current environment (pip)"
 	@echo ""
@@ -50,7 +50,7 @@ coverage-html: coverage
 
 lint:
 	@if command -v ruff >/dev/null; then \
-		ruff check umcp.py aioumcp.py examples/ tests/; \
+		ruff check umcp.py aioumcp.py umcp_shared.py; \
 	else \
 		echo "ruff not installed; skipping"; \
 	fi

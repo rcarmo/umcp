@@ -1,24 +1,25 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
 import io
-import socket
-import threading
 import time
-
-import pytest
-import aioumcp as aioumcp_module
-import umcp as umcp_module
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from json import dumps, loads
 
+import pytest
+
+import aioumcp as aioumcp_module
+import umcp as umcp_module
 from aioumcp import AsyncMCPServer
 from umcp import MCPServer
 from umcp_shared import (
-    MCPHTTPResponse, MCPPrincipal, MCPRequestContext, get_request_context,
-    media_accepts_json, origin_is_allowed,
+    MCPHTTPResponse,
+    MCPPrincipal,
+    MCPRequestContext,
+    get_request_context,
+    media_accepts_json,
+    origin_is_allowed,
 )
 
 
@@ -273,10 +274,11 @@ def test_async_non_dict_json_rpcs_return_invalid_request() -> None:
 
 
 def test_context_isolated_across_threads_and_async_tasks() -> None:
-    request = lambda request_id, delay: dumps({
-        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
-        "params": {"name": "identity", "arguments": {"delay": delay}},
-    })
+    def request(request_id: int, delay: float) -> str:
+        return dumps({
+            "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+            "params": {"name": "identity", "arguments": {"delay": delay}},
+        })
 
     sync_server = ConcurrentSync()
     def sync_call(name: str, request_id: int, delay: float):
@@ -531,7 +533,7 @@ def test_async_http_preflight_requires_valid_origin_and_authorization_can_forbid
 @pytest.mark.parametrize(
     ("raw_request", "body", "status"),
     [
-        ("GET /mcp HTTP/1.1\nOrigin: http://allowed\nContent-Length: 0", b"", b"405 Method Not Allowed"),
+        ("GET /mcp HTTP/1.1\nOrigin: http://allowed\nContent-Length: 0", b"", b"401 Unauthorized"),
         ("POST /mcp HTTP/1.1\nOrigin: http://allowed\nContent-Type: text/plain\nAccept: application/json\nAuthorization: Bearer ok\nContent-Length: 0", b"", b"415 Unsupported Media Type"),
         ("POST /mcp HTTP/1.1\nOrigin: http://allowed\nContent-Type: application/json\nAccept: text/plain\nAuthorization: Bearer ok\nContent-Length: 0", b"", b"406 Not Acceptable"),
         ("POST /mcp HTTP/1.1\nOrigin: http://allowed\nContent-Type: application/json\nAccept: application/json\nMCP-Protocol-Version: 2025-03-26\nContent-Length: 0", b"", b"401 Unauthorized"),
@@ -675,11 +677,11 @@ def test_async_http_rejects_invalid_utf8_version_and_ambiguous_host() -> None:
 def test_async_streamable_http_rejects_invalid_host_and_duplicate_singleton_headers() -> None:
     body = dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).encode()
     cases = [
-        "POST /mcp HTTP/1.1\nContent-Type: application/json\nAccept: application/json\nContent-Length: %d" % len(body),
-        "POST /mcp HTTP/1.1\nHost: a\nHost: b\nContent-Type: application/json\nAccept: application/json\nContent-Length: %d" % len(body),
-        "POST /mcp HTTP/1.1\nHost: a\nAuthorization: one\nAuthorization: two\nContent-Type: application/json\nAccept: application/json\nContent-Length: %d" % len(body),
-        "POST /mcp HTTP/1.1\nHost: a\nMCP-Protocol-Version: 2025-03-26\nMCP-Protocol-Version: 2025-03-26\nContent-Type: application/json\nAccept: application/json\nContent-Length: %d" % len(body),
-        "POST /mcp HTTP/1.1\nHost: a\nTransfer-Encoding: chunked\nContent-Type: application/json\nAccept: application/json\nContent-Length: %d" % len(body),
+        f"POST /mcp HTTP/1.1\nContent-Type: application/json\nAccept: application/json\nContent-Length: {len(body)}",
+        f"POST /mcp HTTP/1.1\nHost: a\nHost: b\nContent-Type: application/json\nAccept: application/json\nContent-Length: {len(body)}",
+        f"POST /mcp HTTP/1.1\nHost: a\nAuthorization: one\nAuthorization: two\nContent-Type: application/json\nAccept: application/json\nContent-Length: {len(body)}",
+        f"POST /mcp HTTP/1.1\nHost: a\nMCP-Protocol-Version: 2025-03-26\nMCP-Protocol-Version: 2025-03-26\nContent-Type: application/json\nAccept: application/json\nContent-Length: {len(body)}",
+        f"POST /mcp HTTP/1.1\nHost: a\nTransfer-Encoding: chunked\nContent-Type: application/json\nAccept: application/json\nContent-Length: {len(body)}",
     ]
     for request in cases:
         wire = b"".join(asyncio.run(_run_async(
