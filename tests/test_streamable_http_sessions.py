@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -26,9 +27,13 @@ def _unused_port() -> int:
 @contextmanager
 def _running_server(mode: str) -> Iterator[int]:
     port = _unused_port()
+    root = str(SERVER_FIXTURE.parents[2])
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (root, env.get("PYTHONPATH"))))
     process = subprocess.Popen(
         [sys.executable, str(SERVER_FIXTURE), mode, str(port)],
-        cwd=SERVER_FIXTURE.parents[2],
+        cwd=root,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
