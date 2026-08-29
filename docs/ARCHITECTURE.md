@@ -4,9 +4,9 @@
 Protocol][mcp] in Python. `umcp.py` contains the synchronous server,
 `aioumcp.py` contains its asynchronous sibling, and `umcp_shared.py` keeps
 protocol versions, immutable principals, and request-local context from
-drifting between them. Both base classes introspect subclass
-methods, generates JSON Schema from their type hints, and serves a
-JSON-RPC 2.0 protocol over stdio, Streamable HTTP, legacy SSE, or TCP.
+drifting between them. Both base classes introspect subclass methods,
+generate JSON Schema from their type hints, and serve a JSON-RPC 2.0
+protocol over stdio, Streamable HTTP, legacy SSE, or TCP.
 
 This document covers what's in there and why. For chaining patterns and
 recommendations for how MCP servers should *behave* once they're built,
@@ -40,15 +40,16 @@ server is the natural fit for the bulk of real-world tools.
 streaming responses from upstream services, multiple in-flight requests
 to a remote API, websockets, anything where blocking the event loop
 would mean blocking the whole server. Network I/O is where `asyncio`
-actually pays for itself, and where the SSE transport (which is itself
-HTTP and benefits from non-blocking sockets) belongs.
+actually pays for itself, including long-lived HTTP event streams. The
+synchronous HTTP transports instead isolate connections in threads.
 
-The fork-and-keep-in-sync cost is real but contained: the two files are
-deliberately structured to make diffs easy to read, and the test suite
-catches drift. The alternative -- a single async base with sync wrappers
--- adds an event loop to every tool that doesn't need one and makes
-local-disk tools harder to reason about. Two files, kept tidy, beat one
-file with a coloured-function problem.
+The fork-and-keep-in-sync cost is real but contained: the two base-class
+files are deliberately structured to make diffs easy to read, shared
+transport contracts live in `umcp_shared.py`, and the test suite catches
+drift. The alternative -- a single async base with sync wrappers -- adds an
+event loop to every tool that doesn't need one and makes local-disk tools
+harder to reason about. Two base classes, kept tidy, beat one file with a
+coloured-function problem.
 
 A rough rule for which to subclass: if your tools call `open()`,
 `subprocess.run()`, or anything in `pathlib`/`os`, use `MCPServer`. If
@@ -343,9 +344,10 @@ Notifications are best-effort and transport-aware:
 subscribed to that URI (the spec's intent -- there's no point in
 broadcasting changes nobody asked for). The async base exposes both as
 coroutines (`await self.notify_resource_updated(...)`); the sync base
-as plain methods. Both write SSE messages to every connected session
-when SSE is the active transport, and fall back to a single
-newline-delimited message on stdout for stdio / TCP / file mode.
+as plain methods. List-change notifications are sent to active legacy SSE
+and Streamable HTTP event streams; resource updates are restricted to
+sessions subscribed to that URI. Without an active HTTP event stream,
+notifications use the transport's newline-delimited output.
 
 Unknown URIs return JSON-RPC error `-32002` with the URI in the `data`
 field, matching the spec's error-handling guidance.
@@ -382,19 +384,20 @@ sanitize likely secrets recursively unless the caller passes
 
 A few things you might expect that aren't here, with reasons.
 
-*No streaming responses.* The MCP spec defines `notifications/progress`
-and partial results, but the bulk of real-world tools either return
-quickly or don't have meaningful intermediate state. Adding streaming
-would complicate every tool author's contract for the benefit of a
-small minority. A future addition, if the use case becomes common.
+*No streaming tool response bodies or partial tool results.* The runtime
+supports server-originated progress, logging, and list-change notifications,
+including delivery through Streamable HTTP event streams. A tool call itself
+still returns one complete result; a partial-result contract would complicate
+every tool author interface for a small minority of calls.
 
 *No built-in authentication backend or policy engine.* The stdio transport
 is owned by the host process, which is its security boundary. Streamable
 HTTP exposes `authenticate_request()` and `authorize_request()` hooks and
 stores the resulting principal in immutable request context. Applications
 still own credential validation and role policy; a trusted reverse proxy is
-also a sensible boundary. Legacy SSE and TCP bind to localhost and do not
-use the HTTP hooks.
+also a sensible boundary. Legacy SSE applies the same hooks to its GET and
+POST endpoints. Raw TCP binds to localhost by default and has no HTTP
+authentication layer.
 
 *No concurrency for synchronous stdio or file input.* Those modes dispatch
 one message at a time. The synchronous TCP and HTTP transports use the
@@ -420,6 +423,7 @@ rather than pulling in `aiohttp` or `starlette` for the same reason.
 umcp/
   umcp.py                    -- sync MCPServer base class
   aioumcp.py                 -- async AsyncMCPServer base class
+  umcp_shared.py             -- protocol, principal, and request context types
 
   examples/                  -- runnable example servers
     movie_server.py            -- CRUD over an in-memory store
@@ -437,18 +441,22 @@ umcp/
     test_movieserver.py      -- worked-example end-to-end test
     test_resources.py        -- resources/* coverage for both bases
     test_schema_fallbacks.py -- exotic-type schema fallback behaviour
+    test_streamable_http_sessions.py
+                             -- connection/session/SSE lifecycle parity
 
   docs/
     ARCHITECTURE.md          -- this file
     CHAINING.md              -- patterns for chaining MCP tool calls
     PROMPTS.md               -- prompt template documentation
+    STREAMABLE_HTTP.md       -- connection, session, SSE, and CORS contract
 
   readme.md                  -- quick-start and API reference
   LICENSE                    -- MIT
 ```
 
-The directory structure is flat on purpose. The whole library is two
-files; the rest is examples, tests, and documentation.
+The directory structure is flat on purpose. The runtime is three files --
+two base-class implementations plus their shared protocol types; the rest is
+examples, tests, and documentation.
 
 ## Testing notes
 
@@ -471,9 +479,11 @@ layer of the library at a time:
   subscription gating works).
 * **Transports** -- `test_async_servers.py` (async stdio over subprocess),
   `test_transports.py` (sync stdio, TCP, legacy SSE, and Streamable HTTP
-  subprocess tests), `test_streamable_http_sync_async.py` (parity), and
+  subprocess tests), `test_streamable_http_sync_async.py` (dispatch parity),
   `test_streamable_http_regressions.py` (auth, negotiation, limits, Origin,
-  CORS, context isolation, and remote-safe failures).
+  CORS, context isolation, and remote-safe failures), and
+  `test_streamable_http_sessions.py` (persistent connections, binding,
+  authenticated SSE, reconnect, expiry, and DELETE parity).
 
 End-to-end suites spawn the example servers as subprocesses and
 round-trip JSON-RPC requests; this catches transport and framing bugs

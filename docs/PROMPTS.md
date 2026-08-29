@@ -147,7 +147,9 @@ async def prompt_fetch_and_summarize(self, url: str, max_length: int = 500) -> s
 
 `prompts/list` returns the full stable-sorted catalogue by default. If you
 pass `pageSize`, the response is paginated and may include `nextCursor`;
-invalid cursors are rejected with `-32602`.
+invalid cursors are rejected with `-32602`. Python defaults make parameters
+optional and are applied when the prompt runs, but are not emitted as JSON
+Schema `default` values.
 
 **Response:**
 
@@ -164,7 +166,7 @@ invalid cursors are rejected with `-32602`.
           "type": "object",
           "properties": {
             "name": { "type": "string" },
-            "formal": { "type": "boolean", "default": false }
+            "formal": { "type": "boolean" }
           },
           "required": ["name"]
         },
@@ -177,7 +179,7 @@ invalid cursors are rejected with `-32602`.
           "type": "object",
           "properties": {
             "filename": { "type": "string" },
-            "issues": { "type": "integer", "default": 0 }
+            "issues": { "type": "integer" }
           },
           "required": ["filename"]
         },

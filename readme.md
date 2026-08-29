@@ -597,6 +597,7 @@ python -m pytest tests/test_resources.py -v
 | `test_shared_negotiation_context.py` | protocol negotiation and immutable request/principal context |
 | `test_streamable_http_sync_async.py` | matching sync/async Streamable HTTP dispatch |
 | `test_streamable_http_regressions.py` | auth, Origin, CORS, limits, context isolation, CLI, and remote-safe errors |
+| `test_streamable_http_sessions.py` | HTTP persistence, session binding, authenticated SSE, reconnect, expiry, and DELETE parity |
 | `simple_async_test.py` | smoke tests for the async base |
 
 The suite covers both bases and runs on Python 3.10, 3.11, and 3.12.
@@ -651,7 +652,8 @@ umcp/
 ├── docs/
 │   ├── ARCHITECTURE.md    -- design, transports, schema generation
 │   ├── CHAINING.md        -- chaining patterns for MCP server authors
-│   └── PROMPTS.md         -- prompt template reference
+│   ├── PROMPTS.md         -- prompt template reference
+│   └── STREAMABLE_HTTP.md -- connection, session, SSE, and CORS contract
 ├── readme.md              -- this file
 └── LICENSE
 ```
@@ -697,13 +699,16 @@ Then `/mcp my-weather-server get weather for New York` from Copilot Chat.
 
 ## 🚫 Limitations
 
-* No streaming responses -- partial results aren't supported.
-* No built-in authentication backend or policy engine. Streamable HTTP
-  exposes `authenticate_request()` and `authorize_request()` hooks, and
-  reverse proxies can supply trusted identity, but the application owns
+* No streaming tool response bodies or partial tool results. Server-originated
+  progress, logging, and list-change notifications can still use an attached
+  event stream.
+* No built-in authentication backend or policy engine. Streamable HTTP and
+  legacy SSE expose `authenticate_request()` and `authorize_request()` hooks,
+  and reverse proxies can supply trusted identity, but the application owns
   credentials, roles, and policy.
-* No concurrency in the synchronous version -- one request at a time.
-  Use `AsyncMCPServer` if you need overlapping I/O.
+* Synchronous stdio and file input process one request at a time. The
+  synchronous TCP and HTTP servers are threaded; use `AsyncMCPServer` when
+  overlapping network I/O is the dominant workload.
 
 For most AI-assistant / local-tool use cases, none of these are
 blocking. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#what-umcp-deliberately-doesnt-do)
@@ -729,10 +734,11 @@ If you need network access, prefer **streamable HTTP** over legacy SSE/TCP:
 * expect `OPTIONS` preflight only when the browser sends a valid `Origin`.
 
 A typical reverse-proxy setup should preserve `Host`, `Authorization`,
-`Origin`, `Accept`, `Content-Type`, and `MCP-Protocol-Version` headers unchanged,
-and should not inject duplicates or `Transfer-Encoding`.
-If the proxy terminates TLS or auth, keep the upstream `umcp` listener on
-localhost.
+`Origin`, `Accept`, `Content-Type`, `MCP-Protocol-Version`, `Mcp-Session-Id`,
+and `Last-Event-ID` headers unchanged, and should not inject duplicates or
+`Transfer-Encoding`. Disable response buffering for `GET /mcp`, and set proxy
+idle timeouts above the 15-second SSE keepalive interval. If the proxy
+terminates TLS or auth, keep the upstream `umcp` listener on localhost.
 
 Minimal `systemd` service sketch:
 
@@ -754,8 +760,12 @@ WantedBy=multi-user.target
 
 Container deployments should follow the same pattern: keep the container
 port private, expose it through a reverse proxy, and do not publish raw
-SSE/TCP unless you have a separate auth story. Session IDs, if stateful
-HTTP support is added later, are routing identifiers rather than credentials.
+SSE/TCP unless you have a separate auth story. Streamable HTTP session IDs
+are routing identifiers rather than credentials. After an abrupt SSE client
+disconnect, the old stream may continue to return `409` to replacement GETs
+until a notification or periodic keepalive detects the closed socket. Keepalives
+are attempted every 15 seconds by default, but detection can require more than
+one write. Clients should retry that `409` with bounded backoff.
 
 ### Piclaw compatibility smoke test
 
@@ -816,6 +826,8 @@ if __name__ == "__main__":
   this before building anything non-trivial; it's where the real
   reliability work lives.
 * [`docs/PROMPTS.md`](docs/PROMPTS.md) -- prompt template reference.
+* [`docs/STREAMABLE_HTTP.md`](docs/STREAMABLE_HTTP.md) -- persistent
+  connections, sessions, event streams, and browser access.
 * [`python-office-mcp-server`][office] -- production-grade MCP server
   built on `umcp`, with 100+ tools for Word/Excel/PowerPoint editing.
 
